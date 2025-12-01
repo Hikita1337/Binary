@@ -1,211 +1,89 @@
-// server.js — Node (ESM) + ws
-import WebSocket from "ws";
-import http from "http";
-import fs from "fs";
-import path from "path";
-import os from "os";
+const express = require('express');
+const axios = require('axios');
 
-// ----------------- Конфиг -----------------
-const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
-const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
-const CHANNEL = process.env.CHANNEL || "csgorun:crash";
-const PORT = Number(process.env.PORT || 10000);
-const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 40000);
-const MAX_LOG_BYTES = Number(process.env.MAX_LOG_BYTES || 100 * 1024 * 1024);
-const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 5 * 60 * 1000);
-const OPEN_TIMEOUT_MS = Number(process.env.OPEN_TIMEOUT_MS || 15000);
+const app = express();
+const PORT = 3000;
 
-// ----------------- Состояние -----------------
-let ws = null;
-let running = true;
-let reconnectAttempts = 0;
-let sessionStartTs = null;
-let lastPongTs = null;
-let lastDisconnect = null;
+// Твой краткоживущий JWT
+const JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc';
 
-let logs = [];
-let logsBytes = 0;
+// Начальная игра
+let currentGameId = 6233329;
 
-// объект GameID -> Set уникальных user.id
-let gamesStats = {};
+// Храним все игры здесь
+let gamesBuffer = [];
 
-function nowIso() { return new Date().toISOString(); }
-
-function approxSizeOfObj(o) {
-  try { return Buffer.byteLength(JSON.stringify(o), "utf8"); } catch { return 200; }
-}
-
-function pushLog(entry) {
-  entry.ts = nowIso();
-  const size = approxSizeOfObj(entry);
-  logs.push(entry);
-  logsBytes += size;
-
-  while (logs.length > MAX_LOG_ENTRIES || logsBytes > MAX_LOG_BYTES) {
-    const removed = logs.shift();
-    logsBytes -= approxSizeOfObj(removed);
-    if (logsBytes < 0) logsBytes = 0;
-  }
-
-  const noisyTypes = new Set(["push", "push_full", "raw_msg"]);
-  if (!noisyTypes.has(entry.type)) console.log(JSON.stringify(entry));
-}
-
-// ----------------- Получение токена -----------------
-async function fetchToken() {
-  try {
-    const resp = await fetch(TOKEN_URL, { cache: "no-store" });
-    const j = await resp.json();
-    const token = j?.data?.main?.centrifugeToken || null;
-    pushLog({ type: "token_fetch", ok: !!token });
-    return token;
-  } catch (e) {
-    pushLog({ type: "token_fetch_error", error: String(e) });
-    return null;
-  }
-}
-
-function makeBinaryJsonPong() {
-  return Buffer.from(JSON.stringify({ type: 3 }));
-}
-
-// ----------------- Сбор уникальных участников -----------------
-function collectBets(obj) {
-  if (!obj || typeof obj !== "object") return;
-
-  const bet = obj?.push?.pub?.data?.bet;
-  if (bet && bet.status === 1 && bet.gameId && bet.user?.id) {
-    const gameId = bet.gameId;
-    const userId = bet.user.id;
-    if (!gamesStats[gameId]) gamesStats[gameId] = new Set();
-    gamesStats[gameId].add(userId);
-  }
-
-  for (const key in obj) collectBets(obj[key]);
-}
-
-// ----------------- Обработчики WS -----------------
-function attachWsHandlers(socket) {
-  socket.on("open", () => {
-    reconnectAttempts = 0;
-    sessionStartTs = Date.now();
-    lastPongTs = null;
-    pushLog({ type: "ws_open", url: WS_URL });
-    console.log("[WS] OPEN");
-  });
-
-  socket.on("message", (data) => {
-    let parsed = null;
-    try { parsed = JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : data); } catch {
-      if (Buffer.isBuffer(data)) {
-        try { parsed = JSON.parse(Buffer.from(data.toString(), "base64").toString("utf8")); } catch {}
-      }
-    }
-
-    if (parsed) collectBets(parsed);
-
-    if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
-      try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent", reason: "server_empty_json" }); } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
-      return;
-    }
-    if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect }); return; }
-    if (parsed && parsed.push) return;
-    if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
-  });
-
-  socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); } });
-  socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
-
-  socket.on("close", (code, reasonBuf) => {
-    const reason = (reasonBuf && reasonBuf.length) ? reasonBuf.toString() : "";
-    const durationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
-    lastDisconnect = { ts: nowIso(), code, reason, duration_ms: durationMs };
-    pushLog({ type: "ws_close", code, reason, duration_ms: durationMs });
-    console.log(`[WS] CLOSE code=${code} reason=${reason} duration=${Math.round(durationMs/1000)}s`);
-    sessionStartTs = null;
-  });
-
-  socket.on("error", (err) => { pushLog({ type: "ws_error", error: String(err) }); console.error("[WS ERROR]", err?.message || err); });
-}
-
-// ----------------- Основной цикл -----------------
-async function mainLoop() {
-  while (running) {
+// Функция для запроса одной игры по gameId
+async function fetchGame(gameId) {
     try {
-      const token = await fetchToken();
-      if (!token) { await new Promise(r => setTimeout(r, 3000)); continue; }
+        const res = await axios.get(`https://example.com/api/game/${gameId}`, {
+            headers: { Authorization: `Bearer ${JWT}` }
+        });
 
-      pushLog({ type: "start_connect", url: WS_URL, channel: CHANNEL });
-      console.log("[RUN] connecting to", WS_URL);
+        const data = res.data.data;
 
-      ws = new WebSocket(WS_URL, { handshakeTimeout: OPEN_TIMEOUT_MS });
-      attachWsHandlers(ws);
+        // Преобразуем ставки
+        const bets = data.bets.map(bet => ({
+            userId: bet.user.id,
+            username: bet.user.name,
+            userBlm: bet.user.blm,
+            depositAmount: bet.deposit.amount,
+            withdrawAmount: bet.withdraw.amount,
+            coefficient: bet.coefficient,
+            coefficientAuto: bet.coefficientAuto,
+            time: bet.createdAt,
+            skinsUsed: bet.deposit.items.length
+        }));
 
-      await new Promise((resolve, reject) => {
-        const to = setTimeout(() => reject(new Error("ws open timeout")), OPEN_TIMEOUT_MS);
-        ws.once("open", () => { clearTimeout(to); resolve(); });
-        ws.once("error", (e) => { clearTimeout(to); reject(e); });
-      });
+        return {
+            gameId: data.id,
+            crash: data.crash,
+            salt: data.salt,
+            hashRound: data.hashRound,
+            bets
+        };
 
-      try { ws.send(JSON.stringify({ id:1, connect:{token, subs:{} } })); pushLog({ type:"connect_sent" }); console.log("[WS->] CONNECT sent"); } catch (e) { pushLog({ type:"connect_send_error", error:String(e) }); }
-      await new Promise(r => setTimeout(r, 200));
-      try { ws.send(JSON.stringify({ id:100, subscribe:{channel:CHANNEL} })); pushLog({ type:"subscribe_sent", channel:CHANNEL, id:100 }); console.log("[WS->] subscribe", CHANNEL); } catch(e){pushLog({type:"subscribe_send_error",error:String(e)})}
-
-      await new Promise(resolve => { ws.once("close", resolve); ws.once("error", resolve); });
-
-      reconnectAttempts++;
-      const backoff = Math.min(30000, 2000 * Math.pow(1.5, reconnectAttempts));
-      pushLog({ type:"reconnect_scheduled", attempt:reconnectAttempts, backoff_ms:Math.round(backoff) });
-      await new Promise(r=>setTimeout(r, backoff));
-    } catch(e) {
-      pushLog({ type:"main_loop_exception", error:String(e) });
-      console.error("[MAIN EXCEPTION]", e?.message || e);
-      await new Promise(r=>setTimeout(r,2000));
+    } catch (err) {
+        console.error(`Ошибка запроса gameId ${gameId}:`, err.message);
+        return null;
     }
-  }
 }
 
-// ----------------- HTTP -----------------
-const server = http.createServer((req,res)=>{
-  if(req.url==="/"){ res.writeHead(200,{"Content-Type":"text/plain"}); res.end("ok\n"); return; }
-  if(req.url==="/status"){
-    const connected = !!(ws && ws.readyState === WebSocket.OPEN);
-    const sessionDurationMs = sessionStartTs ? (Date.now()-sessionStartTs) : 0;
-    const payload = { ts:nowIso(), connected, channel:CHANNEL, session_start: sessionStartTs?new Date(sessionStartTs).toISOString():null, session_duration_ms: sessionDurationMs, session_duration_human: sessionDurationMs?`${Math.round(sessionDurationMs/1000)}s`:null, last_pong_ts:lastPongTs?new Date(lastPongTs).toISOString():null, last_disconnect:lastDisconnect||null, logs_count:logs.length };
-    res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(payload)); return;
-  }
-  if(req.url==="/logs"){
-    // вернем объект GameID -> количество участников
-    const output = {};
-    for (const gameId in gamesStats) output[gameId] = gamesStats[gameId].size;
-    const payload = { ts: nowIso(), games: output };
-    res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(payload)); return;
-  }
-  res.writeHead(404); res.end("not found");
+// Функция для пачки игр
+async function fetchGamesBatch(batchSize = 40) {
+    const promises = [];
+    for (let i = 0; i < batchSize; i++) {
+        promises.push(fetchGame(currentGameId));
+        currentGameId--; // идем вниз
+    }
+
+    const results = await Promise.all(promises);
+    const validGames = results.filter(g => g !== null);
+    gamesBuffer.push(...validGames);
+    console.log(`Собрано игр: ${gamesBuffer.length}`);
+}
+
+// Endpoint для отдачи всех игр
+app.get('/games', (req, res) => {
+    res.json({
+        success: true,
+        date: new Date().toISOString(),
+        games: gamesBuffer
+    });
 });
 
-server.listen(PORT,()=>{pushLog({type:"http_listen", port:PORT}); console.log("[HTTP] listening", PORT);});
+// Запуск сервера
+app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
 
-// ----------------- Heartbeat и метадамп -----------------
-setInterval(()=>{
-  const connected = !!(ws && ws.readyState===WebSocket.OPEN);
-  const sessionDurationMs = sessionStartTs ? (Date.now()-sessionStartTs) : 0;
-  pushLog({type:"heartbeat", connected, session_duration_ms:sessionDurationMs, logs_count:logs.length, logs_bytes:logsBytes});
-  try {
-    const fn = path.join(os.tmpdir(), `ws_sniffer_meta_${Date.now()}.json`);
-    fs.writeFileSync(fn, JSON.stringify({ ts:nowIso(), connected, entries:logs.length }, null,2));
-    pushLog({ type:"meta_dump_saved", file:fn, entries:logs.length });
-  } catch(e){ pushLog({ type:"meta_dump_err", error:String(e) }); }
-}, HEARTBEAT_MS);
+    // Тест: собираем первую пачку раз в 2 секунды
+    const interval = setInterval(async () => {
+        await fetchGamesBatch(40);
 
-// ----------------- Завершение -----------------
-process.on("SIGINT",()=>{ pushLog({type:"shutdown", signal:"SIGINT"}); running=false; try{if(ws)ws.close();}catch{} process.exit(0); });
-process.on("SIGTERM",()=>{ pushLog({type:"shutdown", signal:"SIGTERM"}); running=false; try{if(ws)ws.close();}catch{} process.exit(0); });
-
-// ----------------- Старт -----------------
-mainLoop().catch(e=>{ pushLog({type:"fatal", error:String(e)}); console.error("[FATAL]", e); process.exit(1); });
-
-// ----------------- KEEP-ALIVE -----------------
-const SELF_URL = process.env.RENDER_EXTERNAL_URL;
-function keepAlive(){ if(!SELF_URL) return; const delay=240000+Math.random()*120000; setTimeout(async()=>{try{await fetch(SELF_URL+"/healthz",{headers:{"User-Agent":"Mozilla/5.0","X-Keep-Alive":String(Math.random())}}); console.log("Keep-alive ping OK");}catch(e){console.log("Keep-alive error:",e.message);} keepAlive(); }, delay);}
-keepAlive();
+        // Остановим после 30 000 игр (или можно убрать лимит для бесконечной работы)
+        if (gamesBuffer.length >= 30000) {
+            console.log('Собрано 30 000 игр, останавливаем сбор.');
+            clearInterval(interval);
+        }
+    }, 2000);
+});
