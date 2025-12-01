@@ -10,8 +10,8 @@ const PORT = process.env.PORT || 3000;
 let gamesBuffer = [];
 
 // Конфигурация
-const API_URL = "https://api.example-game.com/game"; // <-- сюда реальный URL API игры
-const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5..."; // <-- твой токен
+const API_URL = "https://cs2run.app/games"; // <-- сюда реальный URL API игры
+const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc"; // <-- твой токен
 
 // Функция для получения игр пачкой
 async function fetchGamesBatch(startGameId, batchSize) {
@@ -61,7 +61,7 @@ app.get("/games", (req, res) => {
 
 // Старт сбора игр
 app.get("/start", async (req, res) => {
-  const startGameId = parseInt(req.query.startId) || 6233329;
+  const startGameId = parseInt(req.query.startId) || 6233360;
   const batchSize = parseInt(req.query.batchSize) || 40;
   const totalGames = parseInt(req.query.totalGames) || 30000;
 
