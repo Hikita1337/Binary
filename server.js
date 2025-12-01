@@ -2,6 +2,7 @@
 // index.js
 import express from "express";
 import fetch from "node-fetch";
+import { createClient as createRedisClient } from "redis";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
