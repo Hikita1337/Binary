@@ -16,44 +16,48 @@ const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQi
 
 // Функция для получения игр пачкой
 async function fetchGamesBatch(startGameId, batchSize) {
-  const batchGames = [];
+  const requests = [];
   for (let i = 0; i < batchSize; i++) {
     const gameId = startGameId - i;
-    try {
-      const response = await fetch(`${API_URL}/${gameId}`, {
-        headers: {
-          Authorization: `JWT ${JWT_TOKEN}`,
-        },
-      });
-      const data = await response.json();
-
-      // Чистый JSON по твоему формату
-      const game = {
-        id: data.data.id,
-        crash: data.data.crash,
-        salt: data.data.salt,
-        hashRound: data.data.hashRound,
-        bets: data.data.bets.map(bet => ({
-          userId: bet.user.id,
-          userName: bet.user.name,
-          userBlm: bet.user.blm,
-          depositAmount: bet.deposit.amount,
-          withdrawAmount: bet.withdraw.amount,
-          coefficient: bet.coefficient,
-          coefficientAuto: bet.coefficientAuto,
-          itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
-        })),
-      };
-      batchGames.push(game);
-    } catch (err) {
-      console.log(`Ошибка при запросе игры ${gameId}:`, err.message);
-    }
-
-    // Пауза 1.5 сек между запросами
-    await new Promise(r => setTimeout(r, 3000));
+    requests.push(
+      fetch(`${API_URL}/${gameId}`, {
+        headers: { Authorization: `JWT ${JWT_TOKEN}` },
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (!data.data) {
+            console.log(`Игра ${gameId} недоступна`);
+            return null;
+          }
+          return {
+            id: data.data.id,
+            crash: data.data.crash,
+            salt: data.data.salt,
+            hashRound: data.data.hashRound,
+            bets: data.data.bets.map(bet => ({
+              userId: bet.user.id,
+              userName: bet.user.name,
+              userBlm: bet.user.blm,
+              depositAmount: bet.deposit.amount,
+              withdrawAmount: bet.withdraw.amount,
+              coefficient: bet.coefficient,
+              coefficientAuto: bet.coefficientAuto,
+              itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
+            })),
+          };
+        })
+        .catch(err => {
+          console.log(`Ошибка при запросе игры ${gameId}:`, err.message);
+          return null;
+        })
+    );
   }
-  return batchGames;
+
+  const batchGames = await Promise.all(requests);
+  // Убираем null
+  return batchGames.filter(Boolean);
 }
+
 
 // Публичный endpoint для всех игр
 app.get("/games", (req, res) => {
@@ -68,11 +72,14 @@ app.get("/start", async (req, res) => {
 
   let currentId = startGameId;
   while (gamesBuffer.length < totalGames) {
-    const batch = await fetchGamesBatch(currentId, batchSize);
-    gamesBuffer.push(...batch);
-    currentId -= batchSize;
-    console.log(`Собрано ${gamesBuffer.length} игр`);
-  }
+  const batch = await fetchGamesBatch(currentId, batchSize);
+  gamesBuffer.push(...batch);
+  currentId -= batchSize;
+  console.log(`Собрано ${gamesBuffer.length} игр`);
+  
+  // пауза 2–3 секунды между пачками
+  await new Promise(r => setTimeout(r, 2000));
+}
 
   res.json({ message: `Собрано ${gamesBuffer.length} игр` });
 });
