@@ -1,3 +1,4 @@
+// index.js
 import express from "express";
 import fetch from "node-fetch";
 import { createClient as createRedisClient } from "redis";
@@ -9,50 +10,55 @@ const PORT = process.env.PORT || 3000;
 let gamesBuffer = [];
 
 // Конфигурация
-const API_URL = "https://cs2run.app/games"; // <-- URL API игры
-const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc"; // <-- твой токен
+const API_URL = "https://cs2run.app/games"; 
+const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc";
 
-// Функция для получения пачки игр параллельно
-async function fetchGamesBatch(startGameId, batchSize) {
-  const requests = [];
-  for (let i = 0; i < batchSize; i++) {
-    const gameId = startGameId - i;
-    requests.push(
-      fetch(`${API_URL}/${gameId}`, {
-        headers: { Authorization: `JWT ${JWT_TOKEN}` },
-      })
-        .then(res => res.json())
-        .then(data => {
-          if (!data.data) {
-            console.log(`Игра ${gameId} недоступна`);
-            return null;
-          }
-          return {
-            id: data.data.id,
-            crash: data.data.crash,
-            salt: data.data.salt,
-            hashRound: data.data.hashRound,
-            bets: data.data.bets.map(bet => ({
-              userId: bet.user.id,
-              userName: bet.user.name,
-              userBlm: bet.user.blm,
-              depositAmount: bet.deposit.amount,
-              withdrawAmount: bet.withdraw.amount,
-              coefficient: bet.coefficient,
-              coefficientAuto: bet.coefficientAuto,
-              itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
-            })),
-          };
-        })
-        .catch(err => {
-          console.log(`Ошибка при запросе игры ${gameId}:`, err.message);
-          return null;
-        })
-    );
+// Функция последовательного сбора игр
+async function fetchGamesSequential(startGameId, totalGames) {
+  let currentId = startGameId;
+
+  while (gamesBuffer.length < totalGames) {
+    try {
+      const response = await fetch(`${API_URL}/${currentId}`, {
+        headers: {
+          "Authorization": `JWT ${JWT_TOKEN}`,
+          "Accept": "application/json, text/plain, */*",
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1",
+          "Referer": "https://csgoyz.run/crash/"
+        },
+      });
+
+      const data = await response.json();
+
+      if (!data.data) {
+        console.log(`Игра ${currentId} недоступна`);
+      } else {
+        const game = {
+          id: data.data.id,
+          crash: data.data.crash,
+          salt: data.data.salt,
+          hashRound: data.data.hashRound,
+          bets: data.data.bets.map(bet => ({
+            userId: bet.user.id,
+            userName: bet.user.name,
+            userBlm: bet.user.blm,
+            depositAmount: bet.deposit.amount,
+            withdrawAmount: bet.withdraw.amount,
+            coefficient: bet.coefficient,
+            coefficientAuto: bet.coefficientAuto,
+            itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
+          })),
+        };
+        gamesBuffer.push(game);
+        console.log(`Собрано ${gamesBuffer.length} игр`);
+      }
+    } catch (err) {
+      console.log(`Ошибка при запросе игры ${currentId}:`, err.message);
+    }
+
+    currentId--;
+    await new Promise(r => setTimeout(r, 1000)); // пауза 1 секунда
   }
-
-  const batchGames = await Promise.all(requests);
-  return batchGames.filter(Boolean);
 }
 
 // Публичный endpoint для всех игр
@@ -63,21 +69,10 @@ app.get("/games", (req, res) => {
 // Старт сбора игр
 app.get("/start", async (req, res) => {
   const startGameId = parseInt(req.query.startId) || 6233360;
-  const batchSize = parseInt(req.query.batchSize) || 18;
   const totalGames = parseInt(req.query.totalGames) || 30000;
 
-  let currentId = startGameId;
-  while (gamesBuffer.length < totalGames) {
-    const batch = await fetchGamesBatch(currentId, batchSize);
-    gamesBuffer.push(...batch);
-    currentId -= batchSize;
-    console.log(`Собрано ${gamesBuffer.length} игр`);
-
-    // Пауза между пачками, чтобы API не ругался
-    await new Promise(r => setTimeout(r, 2500));
-  }
-
-  res.json({ message: `Собрано ${gamesBuffer.length} игр` });
+  fetchGamesSequential(startGameId, totalGames);
+  res.json({ message: `Сбор игр запущен с ID ${startGameId} на ${totalGames} игр` });
 });
 
 // Endpoint для завершения контейнера
