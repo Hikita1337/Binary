@@ -72,10 +72,14 @@ function makeBinaryJsonPong() {
 // ----------------- Рекурсивный сбор ставок -----------------
 function collectBets(obj) {
   if (!obj || typeof obj !== "object") return;
-  if (obj.bet?.status === 1 && obj.bet.id) {
-    const gameId = obj.bet.id;
+
+  // если есть ставка с status 1 — берём gameId
+  if (obj.bet?.status === 1 && obj.bet.gameId) {
+    const gameId = obj.bet.gameId;
     gamesStats[gameId] = (gamesStats[gameId] || 0) + 1;
   }
+
+  // рекурсивно проверяем все поля
   for (const key in obj) collectBets(obj[key]);
 }
 
@@ -89,28 +93,29 @@ function attachWsHandlers(socket) {
     console.log("[WS] OPEN");
   });
 
-  socket.on("message", (data) => {
-    // пытаемся декодировать JSON
-    let parsed = null;
-    let txt;
-    try { txt = Buffer.isBuffer(data) ? data.toString("utf8") : String(data); parsed = JSON.parse(txt); } catch {}
-    
-    if (!parsed && Buffer.isBuffer(data)) {
+socket.on("message", (data) => {
+  let parsed = null;
+
+  try {
+    parsed = JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : data);
+  } catch {
+    // если бинарные данные — пытаемся base64
+    if (Buffer.isBuffer(data)) {
       try { parsed = JSON.parse(Buffer.from(data.toString(), "base64").toString("utf8")); } catch {}
     }
+  }
 
-    // Если удалось распарсить, ищем ставки
-    if (parsed) collectBets(parsed);
+  if (parsed) collectBets(parsed);
 
-    // обрабатываем системные сообщения
-    if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
-      try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent", reason: "server_empty_json" }); } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
-      return;
-    }
-    if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect }); return; }
-    if (parsed && parsed.push) return;
-    if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
-  });
+  // остальная логика websocket без изменений
+  if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
+    try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent", reason: "server_empty_json" }); } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
+    return;
+  }
+  if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect }); return; }
+  if (parsed && parsed.push) return;
+  if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
+});
 
   socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); } });
   socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
