@@ -26,7 +26,7 @@ let lastDisconnect = null;
 let logs = [];
 let logsBytes = 0;
 
-// объект GameID -> количество участников
+// объект GameID -> Set уникальных user.id
 let gamesStats = {};
 
 function nowIso() { return new Date().toISOString(); }
@@ -69,17 +69,18 @@ function makeBinaryJsonPong() {
   return Buffer.from(JSON.stringify({ type: 3 }));
 }
 
-// ----------------- Рекурсивный сбор ставок -----------------
+// ----------------- Сбор уникальных участников -----------------
 function collectBets(obj) {
   if (!obj || typeof obj !== "object") return;
 
-  // если есть ставка с status 1 — берём gameId
-  if (obj.bet?.status === 1 && obj.bet.gameId) {
-    const gameId = obj.bet.gameId;
-    gamesStats[gameId] = (gamesStats[gameId] || 0) + 1;
+  const bet = obj?.push?.pub?.data?.bet;
+  if (bet && bet.status === 1 && bet.gameId && bet.user?.id) {
+    const gameId = bet.gameId;
+    const userId = bet.user.id;
+    if (!gamesStats[gameId]) gamesStats[gameId] = new Set();
+    gamesStats[gameId].add(userId);
   }
 
-  // рекурсивно проверяем все поля
   for (const key in obj) collectBets(obj[key]);
 }
 
@@ -93,29 +94,24 @@ function attachWsHandlers(socket) {
     console.log("[WS] OPEN");
   });
 
-socket.on("message", (data) => {
-  let parsed = null;
-
-  try {
-    parsed = JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : data);
-  } catch {
-    // если бинарные данные — пытаемся base64
-    if (Buffer.isBuffer(data)) {
-      try { parsed = JSON.parse(Buffer.from(data.toString(), "base64").toString("utf8")); } catch {}
+  socket.on("message", (data) => {
+    let parsed = null;
+    try { parsed = JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : data); } catch {
+      if (Buffer.isBuffer(data)) {
+        try { parsed = JSON.parse(Buffer.from(data.toString(), "base64").toString("utf8")); } catch {}
+      }
     }
-  }
 
-  if (parsed) collectBets(parsed);
+    if (parsed) collectBets(parsed);
 
-  // остальная логика websocket без изменений
-  if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
-    try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent", reason: "server_empty_json" }); } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
-    return;
-  }
-  if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect }); return; }
-  if (parsed && parsed.push) return;
-  if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
-});
+    if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
+      try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent", reason: "server_empty_json" }); } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
+      return;
+    }
+    if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect }); return; }
+    if (parsed && parsed.push) return;
+    if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
+  });
 
   socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); } });
   socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
@@ -180,7 +176,9 @@ const server = http.createServer((req,res)=>{
   }
   if(req.url==="/logs"){
     // вернем объект GameID -> количество участников
-    const payload = { ts:nowIso(), games: {...gamesStats} };
+    const output = {};
+    for (const gameId in gamesStats) output[gameId] = gamesStats[gameId].size;
+    const payload = { ts: nowIso(), games: output };
     res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(payload)); return;
   }
   res.writeHead(404); res.end("not found");
