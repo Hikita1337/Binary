@@ -1,12 +1,13 @@
-// server.js — финальная версия
-// Node (ESM) + ws
-// Установка: npm i ws
+// server.js — Node (ESM) + ws
+// npm i ws
 
 import WebSocket from "ws";
 import http from "http";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import zlib from "zlib";
+import crypto from "crypto";
 
 // ----------------- Конфиг (env или дефолты) -----------------
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
@@ -34,7 +35,7 @@ let logsBytes = 0;
 
 function nowIso() { return new Date().toISOString(); }
 
-// ----------------- Логирование (пуш-уведомления ОТСЕКАЕМ полностью) -----------------
+// ----------------- Логирование -----------------
 function approxSizeOfObj(o) {
   try {
     return Buffer.byteLength(JSON.stringify(o), "utf8");
@@ -42,6 +43,11 @@ function approxSizeOfObj(o) {
     return 200;
   }
 }
+
+function sha256Hex(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
 function pushLog(entry) {
   entry.ts = nowIso();
   const size = approxSizeOfObj(entry);
@@ -58,10 +64,7 @@ function pushLog(entry) {
   // Для консоли выводим только важные типы (не пуши)
   const noisyTypes = new Set(["push", "push_full", "raw_msg"]);
   if (!noisyTypes.has(entry.type)) {
-    // компактный human-readable вывод
     console.log(JSON.stringify(entry));
-  } else {
-    // не выводим ничего для пушей
   }
 }
 
@@ -94,7 +97,6 @@ function attachWsHandlers(socket) {
   });
 
   socket.on("message", (data, isBinary) => {
-    // Попытка распарсить JSON (если возможно)
     let parsed = null;
     let txt;
     try {
@@ -104,7 +106,7 @@ function attachWsHandlers(socket) {
       parsed = null;
     }
 
-    // Если JSON и пустой объект {} — это обычный центрифюжный "ping" -> отвечаем бинарным {"type":3}
+    // JSON пустой — ping центрифуги
     if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
       try {
         const pong = makeBinaryJsonPong();
@@ -121,49 +123,63 @@ function attachWsHandlers(socket) {
       return;
     }
 
-    // Если connect ack (id=1 && connect) — логируем
+    // connect ack
     if (parsed && parsed.id === 1 && parsed.connect) {
       pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect });
       return;
     }
 
-    // Если сообщение имеет поле push — ОТСЕКАЕМ: НЕ ЛОГИРУЕМ и НЕ сохраняем (никаких следов)
-    if (parsed && parsed.push) {
-      // deliberately do nothing: ignore push entirely
-      return;
-    }
+    // push — игнорируем
+    if (parsed && parsed.push) return;
 
-    // Если это сообщения служебного характера (id, errors и т.п.) — логируем кратко
+    // сообщения служебного характера
     if (parsed && parsed.id !== undefined) {
       pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" });
       return;
     }
 
-    // Если всё прочее — минимально отмечаем (не сохраняем большие raw-полета)
+    // остальные JSON
     if (parsed) {
       pushLog({ type: "message_parsed", summary: typeof parsed === "object" ? Object.keys(parsed).slice(0,5) : String(parsed).slice(0,200) });
       return;
     }
 
-    // непарсируемое тело — тоже фиксируем кратко
-    pushLog({ type: "message_nonjson", size: Buffer.isBuffer(data) ? data.length : String(data).length });
-  });
+    // ----------- message_nonjson в памяти с анализом -----------
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
 
-  // транспортные ping/pong
-  socket.on("ping", (data) => {
-    // отвечаем transport-level pong
+    let isText = false;
+    let preview = "";
+    let inflatedPreview = "";
+
     try {
-      socket.pong(data);
-      pushLog({ type: "transport_ping_recv" });
-    } catch (e) {
-      pushLog({ type: "transport_ping_err", error: String(e) });
-    }
+      const txt = buffer.toString("utf8");
+      const nonAsciiRatio = txt.replace(/[ -~]/g, "").length / txt.length;
+      isText = nonAsciiRatio < 0.3;
+      preview = isText ? txt.slice(0, 200) : "";
+    } catch {}
+
+    try {
+      const inflated = zlib.inflateSync(buffer);
+      inflatedPreview = inflated.toString("utf8").slice(0, 200);
+    } catch {}
+
+    const hash = sha256Hex(buffer);
+
+    pushLog({
+      type: "message_nonjson",
+      size: buffer.length,
+      isText,
+      preview,
+      inflatedPreview,
+      hash
+    });
   });
 
-  socket.on("pong", (data) => {
-    lastPongTs = Date.now();
-    pushLog({ type: "transport_pong_recv" });
+  socket.on("ping", (data) => {
+    try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); }
   });
+
+  socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
 
   socket.on("close", (code, reasonBuf) => {
     const reason = (reasonBuf && reasonBuf.length) ? reasonBuf.toString() : "";
@@ -174,21 +190,15 @@ function attachWsHandlers(socket) {
     sessionStartTs = null;
   });
 
-  socket.on("error", (err) => {
-    pushLog({ type: "ws_error", error: String(err) });
-    console.error("[WS ERROR]", err?.message || err);
-  });
+  socket.on("error", (err) => { pushLog({ type: "ws_error", error: String(err) }); console.error("[WS ERROR]", err?.message || err); });
 }
 
-// ----------------- Основной цикл (connect -> subscribe -> wait close -> reconnect) -----------------
+// ----------------- Основной цикл -----------------
 async function mainLoop() {
   while (running) {
     try {
       const token = await fetchToken();
-      if (!token) {
-        await new Promise(r => setTimeout(r, 3000));
-        continue;
-      }
+      if (!token) { await new Promise(r => setTimeout(r, 3000)); continue; }
 
       pushLog({ type: "start_connect", url: WS_URL, channel: CHANNEL });
       console.log("[RUN] connecting to", WS_URL);
@@ -196,42 +206,33 @@ async function mainLoop() {
       ws = new WebSocket(WS_URL, { handshakeTimeout: OPEN_TIMEOUT_MS });
       attachWsHandlers(ws);
 
-      // дождемся open или error/timeout
       await new Promise((resolve, reject) => {
         const to = setTimeout(() => reject(new Error("ws open timeout")), OPEN_TIMEOUT_MS);
         ws.once("open", () => { clearTimeout(to); resolve(); });
         ws.once("error", (e) => { clearTimeout(to); reject(e); });
       });
 
-      // отправляем connect payload
       try {
         const connectPayload = { id: 1, connect: { token, subs: {} } };
         ws.send(JSON.stringify(connectPayload));
         pushLog({ type: "connect_sent" });
         console.log("[WS->] CONNECT sent");
-      } catch (e) {
-        pushLog({ type: "connect_send_error", error: String(e) });
-      }
+      } catch (e) { pushLog({ type: "connect_send_error", error: String(e) }); }
 
-      // подписываемся (видимость) — body пушей мы игнорируем далее
       await new Promise(r => setTimeout(r, 200));
       try {
         const payload = { id: 100, subscribe: { channel: CHANNEL } };
         ws.send(JSON.stringify(payload));
         pushLog({ type: "subscribe_sent", channel: CHANNEL, id: 100 });
         console.log("[WS->] subscribe", CHANNEL);
-      } catch (e) {
-        pushLog({ type: "subscribe_send_error", error: String(e) });
-      }
+      } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e)); }
 
-      // ждём закрытия сокета (нет авто-переподключения внутри; reconnect происходит после close)
       await new Promise((resolve) => {
         const onEnd = () => resolve();
         ws.once("close", onEnd);
         ws.once("error", onEnd);
       });
 
-      // socket закрыт -> бэк офф
       reconnectAttempts++;
       const backoff = Math.min(30000, 2000 * Math.pow(1.5, reconnectAttempts));
       pushLog({ type: "reconnect_scheduled", attempt: reconnectAttempts, backoff_ms: Math.round(backoff) });
@@ -244,14 +245,9 @@ async function mainLoop() {
   }
 }
 
-// ----------------- HTTP: / , /status , /logs -----------------
+// ----------------- HTTP -----------------
 const server = http.createServer((req, res) => {
-  if (req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("ok\n");
-    return;
-  }
-
+  if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n"); return; }
   if (req.url === "/status") {
     const connected = !!(ws && ws.readyState === WebSocket.OPEN);
     const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
@@ -270,19 +266,12 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(payload));
     return;
   }
-
   if (req.url === "/logs") {
-    // вернуть текущие логи (последние N)
-    const payload = {
-      ts: nowIso(),
-      count: logs.length,
-      tail: logs.slice(-MAX_LOG_ENTRIES)
-    };
+    const payload = { ts: nowIso(), count: logs.length, tail: logs.slice(-MAX_LOG_ENTRIES) };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(payload));
     return;
   }
-
   res.writeHead(404); res.end("not found");
 });
 
@@ -292,70 +281,35 @@ server.listen(PORT, () => {
 });
 
 // ----------------- Периодические задачи -----------------
-// heartbeat + периодический дамп метаданных (не дампим пуши)
 setInterval(() => {
   const connected = !!(ws && ws.readyState === WebSocket.OPEN);
   const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
   pushLog({ type: "heartbeat", connected, session_duration_ms: sessionDurationMs, logs_count: logs.length, logs_bytes: logsBytes });
-  // небольшой автосейв-маркер (файл с мета-инфой — не содержит push-данных)
   try {
     const fn = path.join(os.tmpdir(), `ws_sniffer_meta_${Date.now()}.json`);
     fs.writeFileSync(fn, JSON.stringify({ ts: nowIso(), connected, entries: logs.length }, null, 2));
     pushLog({ type: "meta_dump_saved", file: fn, entries: logs.length });
-  } catch (e) {
-    pushLog({ type: "meta_dump_err", error: String(e) });
-  }
+  } catch (e) { pushLog({ type: "meta_dump_err", error: String(e) }); }
 }, HEARTBEAT_MS);
 
 // ----------------- Завершение -----------------
-process.on("SIGINT", () => {
-  pushLog({ type: "shutdown", signal: "SIGINT" });
-  running = false;
-  try { if (ws) ws.close(); } catch {}
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  pushLog({ type: "shutdown", signal: "SIGTERM" });
-  running = false;
-  try { if (ws) ws.close(); } catch {}
-  process.exit(0);
-});
+process.on("SIGINT", () => { pushLog({ type: "shutdown", signal: "SIGINT" }); running = false; try { if(ws) ws.close(); } catch {} process.exit(0); });
+process.on("SIGTERM", () => { pushLog({ type: "shutdown", signal: "SIGTERM" }); running = false; try { if(ws) ws.close(); } catch {} process.exit(0); });
 
 // ----------------- Старт -----------------
-mainLoop().catch(e => {
-  pushLog({ type: "fatal", error: String(e) });
-  console.error("[FATAL]", e);
-  process.exit(1);
-});
+mainLoop().catch(e => { pushLog({ type: "fatal", error: String(e) }); console.error("[FATAL]", e); process.exit(1); });
 
-// =============================
-//       KEEP-ALIVE FOR RENDER
-// =============================
+// ----------------- KEEP-ALIVE -----------------
 const SELF_URL = process.env.RENDER_EXTERNAL_URL;
-
 function keepAlive() {
   if (!SELF_URL) return;
-
   const delay = 240000 + Math.random() * 120000; // 4–6 минут
-
   setTimeout(async () => {
     try {
-      await fetch(SELF_URL + "/healthz", {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "X-Keep-Alive": String(Math.random()),
-        },
-      });
-
+      await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } });
       console.log("Keep-alive ping OK");
-    } catch (e) {
-      console.log("Keep-alive error:", e.message);
-    }
-
+    } catch (e) { console.log("Keep-alive error:", e.message); }
     keepAlive();
   }, delay);
 }
-
 keepAlive();
-
