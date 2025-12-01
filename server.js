@@ -22,7 +22,7 @@ async function fetchGamesBatch(startGameId, batchSize) {
     try {
       const response = await fetch(`${API_URL}/${gameId}`, {
         headers: {
-          Authorization: `Bearer ${JWT_TOKEN}`,
+          Authorization: `JWT ${JWT_TOKEN}`,
         },
       });
       const data = await response.json();
