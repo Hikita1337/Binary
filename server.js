@@ -50,7 +50,7 @@ async function fetchGamesBatch(startGameId, batchSize) {
     }
 
     // Пауза 1.5 сек между запросами
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 3000));
   }
   return batchGames;
 }
@@ -63,7 +63,7 @@ app.get("/games", (req, res) => {
 // Старт сбора игр
 app.get("/start", async (req, res) => {
   const startGameId = parseInt(req.query.startId) || 6233360;
-  const batchSize = parseInt(req.query.batchSize) || 40;
+  const batchSize = parseInt(req.query.batchSize) || 18;
   const totalGames = parseInt(req.query.totalGames) || 30000;
 
   let currentId = startGameId;
