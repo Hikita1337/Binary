@@ -225,7 +225,7 @@ async function mainLoop() {
         ws.send(JSON.stringify(payload));
         pushLog({ type: "subscribe_sent", channel: CHANNEL, id: 100 });
         console.log("[WS->] subscribe", CHANNEL);
-      } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e)); }
+      } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e); }
 
       await new Promise((resolve) => {
         const onEnd = () => resolve();
