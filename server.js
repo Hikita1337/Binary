@@ -1,4 +1,4 @@
-// server.js — финальная версия с подсчётом GameID
+// server.js — финальная версия
 // Node (ESM) + ws
 // Установка: npm i ws
 
@@ -32,12 +32,9 @@ let lastDisconnect = null;
 let logs = [];
 let logsBytes = 0;
 
-// ----------------- Сбор статистики по GameID -----------------
-const gameStats = {};
-
-// ----------------- Вспомогательные -----------------
 function nowIso() { return new Date().toISOString(); }
 
+// ----------------- Логирование -----------------
 function approxSizeOfObj(o) {
   try { return Buffer.byteLength(JSON.stringify(o), "utf8"); } catch { return 200; }
 }
@@ -55,9 +52,12 @@ function pushLog(entry) {
   }
 
   const noisyTypes = new Set(["push", "push_full", "raw_msg"]);
-  if (!noisyTypes.has(entry.type)) console.log(JSON.stringify(entry));
+  if (!noisyTypes.has(entry.type)) {
+    console.log(JSON.stringify(entry));
+  }
 }
 
+// ----------------- Вспомогательные -----------------
 async function fetchToken() {
   try {
     const resp = await fetch(TOKEN_URL, { cache: "no-store" });
@@ -65,39 +65,14 @@ async function fetchToken() {
     const token = j?.data?.main?.centrifugeToken || null;
     pushLog({ type: "token_fetch", ok: !!token });
     return token;
-  } catch (e) { pushLog({ type: "token_fetch_error", error: String(e) }); return null; }
+  } catch (e) {
+    pushLog({ type: "token_fetch_error", error: String(e) });
+    return null;
+  }
 }
 
-function makeBinaryJsonPong() { return Buffer.from(JSON.stringify({ type: 3 })); }
-
-// ----------------- Парсинг base64 ставок -----------------
-function parseBase64BetMessage(base64) {
-  let decoded;
-  try {
-    decoded = Buffer.from(base64, "base64").toString("utf8");
-
-    // регулярка для поиска JSON объектов
-    const matches = decoded.match(/\{[^{}]*\}/g);
-    if (!matches) return;
-
-    matches.forEach(m => {
-      try {
-        const obj = JSON.parse(m);
-        // проверка вложенной ставки
-        if (obj?.push?.pub?.data?.bet) {
-          const betData = obj.push.pub.data.bet;
-          if (betData?.status === 1 && betData?.id) {
-            if (!gameStats[betData.id]) gameStats[betData.id] = 0;
-            gameStats[betData.id]++;
-          }
-        }
-      } catch(e) {
-        pushLog({ type: "inner_base64_parse_error", error: String(e) });
-      }
-    });
-  } catch (e) {
-    pushLog({ type: "base64_parse_error", error: String(e) });
-  }
+function makeBinaryJsonPong() {
+  return Buffer.from(JSON.stringify({ type: 3 }));
 }
 
 // ----------------- Обработчики WS -----------------
@@ -113,83 +88,80 @@ function attachWsHandlers(socket) {
   socket.on("message", (data, isBinary) => {
     let parsed = null;
     let txt;
-    try {
-      txt = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-      parsed = JSON.parse(txt);
-    } catch { parsed = null; }
+    try { txt = Buffer.isBuffer(data) ? data.toString("utf8") : String(data); parsed = JSON.parse(txt); } catch { parsed = null; }
 
-    if (parsed && Object.keys(parsed).length === 0) {
-      try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent" }); } catch(e){pushLog({type:"json_pong_exception",error:String(e)});}
+    // Центрифюжный ping
+    if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
+      try {
+        socket.send(makeBinaryJsonPong(), { binary: true });
+        lastPongTs = Date.now();
+        pushLog({ type: "json_pong_sent", reason: "server_empty_json" });
+      } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
       return;
     }
 
-    if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", meta: parsed.connect }); return; }
+    // Connect ack
+    if (parsed && parsed.id === 1 && parsed.connect) {
+      pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect });
+      return;
+    }
+
+    // Основная логика: push-сообщения (игроки, ставки)
     if (parsed && parsed.push) {
-      pushLog({ type: "push_received" });
-      // декодируем base64 ставки
-      if (parsed.push.pub?.data) {
-        parseBase64BetMessage(Buffer.from(JSON.stringify(parsed)).toString("base64"));
+      try {
+        const betsBase64 = parsed.push.data;
+        if (betsBase64) {
+          const decodedStr = Buffer.from(betsBase64, "base64").toString("utf8");
+          const decodedJson = JSON.parse(decodedStr);
+
+          const counts = {};
+          function traverse(obj) {
+            if (obj && typeof obj === "object") {
+              if (obj.bet && obj.bet.data && obj.bet.data.type === "topBetCreated") {
+                const gameId = obj.bet.data.bet.gameId;
+                const status = obj.bet.data.bet.status;
+                if (status === 1) counts[gameId] = (counts[gameId] || 0) + 1;
+              }
+              for (const k in obj) traverse(obj[k]);
+            }
+          }
+          traverse(decodedJson);
+
+          for (const [gameId, participants] of Object.entries(counts)) {
+            pushLog({ type: "game_participants", GameID: gameId, participants });
+          }
+        }
+      } catch (e) {
+        pushLog({ type: "base64_parse_error", error: String(e) });
       }
       return;
     }
-    if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, summary: parsed.error || "ok" }); return; }
 
-    if (parsed) { pushLog({ type: "message_parsed", summary: JSON.stringify(Object.keys(parsed).slice(0,5)) }); return; }
+    if (parsed && parsed.id !== undefined) {
+      pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" });
+      return;
+    }
 
-    // НЕПАРСИРУЕМОЕ сообщение
-    const bufferData = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
-    pushLog({ type: "message_nonjson", size: bufferData.length, base64: bufferData.toString("base64") });
+    if (parsed) {
+      pushLog({ type: "message_parsed", summary: typeof parsed === "object" ? Object.keys(parsed).slice(0,5) : String(parsed).slice(0,200) });
+      return;
+    }
+
+    pushLog({ type: "message_nonjson", size: Buffer.isBuffer(data) ? data.length : String(data).length });
   });
 
-  socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); } });
-  socket.on("pong", () => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
-
+  socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch(e){ pushLog({ type: "transport_ping_err", error: String(e) }); } });
+  socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
   socket.on("close", (code, reasonBuf) => {
-    const reason = reasonBuf?.toString() || "";
+    const reason = (reasonBuf && reasonBuf.length) ? reasonBuf.toString() : "";
     const durationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
     lastDisconnect = { ts: nowIso(), code, reason, duration_ms: durationMs };
     pushLog({ type: "ws_close", code, reason, duration_ms: durationMs });
     console.log(`[WS] CLOSE code=${code} reason=${reason} duration=${Math.round(durationMs/1000)}s`);
     sessionStartTs = null;
   });
-
   socket.on("error", (err) => { pushLog({ type: "ws_error", error: String(err) }); console.error("[WS ERROR]", err?.message || err); });
 }
-
-// ----------------- HTTP -----------------
-const server = http.createServer((req, res) => {
-  if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n"); return; }
-
-  if (req.url === "/status") {
-    const connected = !!(ws && ws.readyState === WebSocket.OPEN);
-    const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
-    const payload = {
-      ts: nowIso(),
-      connected,
-      channel: CHANNEL,
-      session_start: sessionStartTs ? new Date(sessionStartTs).toISOString() : null,
-      session_duration_ms: sessionDurationMs,
-      gameStats, // сюда добавляем GameID и количество участников
-      last_pong_ts: lastPongTs ? new Date(lastPongTs).toISOString() : null,
-      last_disconnect: lastDisconnect || null,
-      logs_count: logs.length
-    };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(payload));
-    return;
-  }
-
-  if (req.url === "/logs") {
-    const payload = { ts: nowIso(), count: logs.length, tail: logs.slice(-MAX_LOG_ENTRIES), gameStats };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(payload));
-    return;
-  }
-
-  res.writeHead(404); res.end("not found");
-});
-
-server.listen(PORT, () => { pushLog({ type: "http_listen", port: PORT }); console.log("[HTTP] listening", PORT); });
 
 // ----------------- Основной цикл -----------------
 async function mainLoop() {
@@ -214,6 +186,7 @@ async function mainLoop() {
         const connectPayload = { id: 1, connect: { token, subs: {} } };
         ws.send(JSON.stringify(connectPayload));
         pushLog({ type: "connect_sent" });
+        console.log("[WS->] CONNECT sent");
       } catch (e) { pushLog({ type: "connect_send_error", error: String(e) }); }
 
       await new Promise(r => setTimeout(r, 200));
@@ -221,6 +194,7 @@ async function mainLoop() {
         const payload = { id: 100, subscribe: { channel: CHANNEL } };
         ws.send(JSON.stringify(payload));
         pushLog({ type: "subscribe_sent", channel: CHANNEL, id: 100 });
+        console.log("[WS->] subscribe", CHANNEL);
       } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e) }); }
 
       await new Promise((resolve) => {
@@ -241,11 +215,51 @@ async function mainLoop() {
   }
 }
 
+// ----------------- HTTP -----------------
+const server = http.createServer((req, res) => {
+  if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n"); return; }
+
+  if (req.url === "/status") {
+    const connected = !!(ws && ws.readyState === WebSocket.OPEN);
+    const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
+    const payload = {
+      ts: nowIso(),
+      connected,
+      channel: CHANNEL,
+      session_start: sessionStartTs ? new Date(sessionStartTs).toISOString() : null,
+      session_duration_ms: sessionDurationMs,
+      session_duration_human: sessionDurationMs ? `${Math.round(sessionDurationMs/1000)}s` : null,
+      last_pong_ts: lastPongTs ? new Date(lastPongTs).toISOString() : null,
+      last_disconnect: lastDisconnect || null,
+      logs_count: logs.length
+    };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  if (req.url === "/logs") {
+    const payload = { ts: nowIso(), count: logs.length, tail: logs.slice(-MAX_LOG_ENTRIES) };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  res.writeHead(404); res.end("not found");
+});
+
+server.listen(PORT, () => { pushLog({ type: "http_listen", port: PORT }); console.log("[HTTP] listening", PORT); });
+
 // ----------------- Периодические задачи -----------------
 setInterval(() => {
   const connected = !!(ws && ws.readyState === WebSocket.OPEN);
   const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
   pushLog({ type: "heartbeat", connected, session_duration_ms: sessionDurationMs, logs_count: logs.length, logs_bytes: logsBytes });
+  try {
+    const fn = path.join(os.tmpdir(), `ws_sniffer_meta_${Date.now()}.json`);
+    fs.writeFileSync(fn, JSON.stringify({ ts: nowIso(), connected, entries: logs.length }, null, 2));
+    pushLog({ type: "meta_dump_saved", file: fn, entries: logs.length });
+  } catch (e) { pushLog({ type: "meta_dump_err", error: String(e) }); }
 }, HEARTBEAT_MS);
 
 // ----------------- Завершение -----------------
@@ -254,3 +268,20 @@ process.on("SIGTERM", () => { pushLog({ type: "shutdown", signal: "SIGTERM" }); 
 
 // ----------------- Старт -----------------
 mainLoop().catch(e => { pushLog({ type: "fatal", error: String(e) }); console.error("[FATAL]", e); process.exit(1); });
+
+// =============================
+//       KEEP-ALIVE FOR RENDER
+// =============================
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+function keepAlive() {
+  if (!SELF_URL) return;
+  const delay = 240000 + Math.random() * 120000;
+  setTimeout(async () => {
+    try {
+      await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } });
+      console.log("Keep-alive ping OK");
+    } catch (e) { console.log("Keep-alive error:", e.message); }
+    keepAlive();
+  }, delay);
+}
+keepAlive();
