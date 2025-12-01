@@ -28,30 +28,35 @@ async function fetchGamesSequential(startGameId, totalGames) {
         },
       });
 
-      const data = await response.json();
-
-      if (!data.data) {
-        console.log(`Игра ${currentId} недоступна`);
+      if (!response.ok) {
+        console.log(`Ошибка при запросе игры ${currentId}: HTTP ${response.status}`);
       } else {
-        const game = {
-          id: data.data.id,
-          crash: data.data.crash,
-          salt: data.data.salt,
-          hashRound: data.data.hashRound,
-          bets: data.data.bets.map(bet => ({
-            userId: bet.user.id,
-            userName: bet.user.name,
-            userBlm: bet.user.blm,
-            depositAmount: bet.deposit.amount,
-            withdrawAmount: bet.withdraw.amount,
-            coefficient: bet.coefficient,
-            coefficientAuto: bet.coefficientAuto,
-            itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
-          })),
-        };
-        gamesBuffer.push(game);
-        console.log(`Собрано ${gamesBuffer.length} игр`);
+        const data = await response.json();
+
+        if (!data.data) {
+          console.log(`Игра ${currentId} вернула пустой объект`);
+        } else {
+          const game = {
+            id: data.data.id,
+            crash: data.data.crash,
+            salt: data.data.salt,
+            hashRound: data.data.hashRound,
+            bets: data.data.bets.map(bet => ({
+              userId: bet.user.id,
+              userName: bet.user.name,
+              userBlm: bet.user.blm,
+              depositAmount: bet.deposit.amount,
+              withdrawAmount: bet.withdraw.amount,
+              coefficient: bet.coefficient,
+              coefficientAuto: bet.coefficientAuto,
+              itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
+            })),
+          };
+          gamesBuffer.push(game);
+          console.log(`Собрано ${gamesBuffer.length} игр`);
+        }
       }
+
     } catch (err) {
       console.log(`Ошибка при запросе игры ${currentId}:`, err.message);
     }
