@@ -11,12 +11,12 @@ import os from "os";
 // ----------------- Конфиг (env или дефолты) -----------------
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
 const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
-const CHANNEL = process.env.CHANNEL || "csgorun:crash"; // подписка для видимости
+const CHANNEL = process.env.CHANNEL || "csgorun:crash";
 const PORT = Number(process.env.PORT || 10000);
 
 const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 40000);
-const MAX_LOG_BYTES = Number(process.env.MAX_LOG_BYTES || 100 * 1024 * 1024); // 100 MiB
-const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 5 * 60 * 1000); // 5 минут
+const MAX_LOG_BYTES = Number(process.env.MAX_LOG_BYTES || 100 * 1024 * 1024);
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 5 * 60 * 1000);
 const OPEN_TIMEOUT_MS = Number(process.env.OPEN_TIMEOUT_MS || 15000);
 
 // ----------------- Состояние -----------------
@@ -28,13 +28,14 @@ let sessionStartTs = null;
 let lastPongTs = null;
 let lastDisconnect = null;
 
-// лог-буфер (круговой с ограничением по записям и по байтам)
 let logs = [];
 let logsBytes = 0;
 
+// ----------------- Статистика игр -----------------
+let gamesStats = {}; // { [GameID]: number_of_participants }
+
 function nowIso() { return new Date().toISOString(); }
 
-// ----------------- Логирование -----------------
 function approxSizeOfObj(o) {
   try { return Buffer.byteLength(JSON.stringify(o), "utf8"); } catch { return 200; }
 }
@@ -44,17 +45,13 @@ function pushLog(entry) {
   const size = approxSizeOfObj(entry);
   logs.push(entry);
   logsBytes += size;
-
   while (logs.length > MAX_LOG_ENTRIES || logsBytes > MAX_LOG_BYTES) {
     const removed = logs.shift();
     logsBytes -= approxSizeOfObj(removed);
     if (logsBytes < 0) logsBytes = 0;
   }
-
   const noisyTypes = new Set(["push", "push_full", "raw_msg"]);
-  if (!noisyTypes.has(entry.type)) {
-    console.log(JSON.stringify(entry));
-  }
+  if (!noisyTypes.has(entry.type)) console.log(JSON.stringify(entry));
 }
 
 // ----------------- Вспомогательные -----------------
@@ -85,72 +82,57 @@ function attachWsHandlers(socket) {
     console.log("[WS] OPEN");
   });
 
-  socket.on("message", (data, isBinary) => {
+  socket.on("message", (data) => {
     let parsed = null;
     let txt;
-    try { txt = Buffer.isBuffer(data) ? data.toString("utf8") : String(data); parsed = JSON.parse(txt); } catch { parsed = null; }
+    try { txt = Buffer.isBuffer(data) ? data.toString("utf8") : String(data); parsed = JSON.parse(txt); } catch {}
+    
+    if (!parsed && Buffer.isBuffer(data)) {
+      // Попытка декодировать Base64
+      try {
+        const decodedStr = Buffer.from(data.toString(), 'base64').toString('utf8');
+        const decoded = JSON.parse(decodedStr);
+        if (decoded && decoded.push && decoded.push.pub && decoded.push.pub.data) {
+          // Ищем ставки людей
+          const bets = decoded.push.pub.data;
+          for (const key in bets) {
+            const bet = bets[key];
+            const betItems = bet?.bet?.deposit?.items || [];
+            if (bet?.bet?.status === 1 && betItems.length > 0) {
+              const gameId = bet.bet.id;
+              gamesStats[gameId] = (gamesStats[gameId] || 0) + 1;
+            }
+          }
+        }
+      } catch (e) {
+        // Игнорируем ошибки парсинга Base64
+      }
+      return;
+    }
 
-    // Центрифюжный ping
+    // === Оригинальные WS логики ===
     if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
       try {
-        socket.send(makeBinaryJsonPong(), { binary: true });
+        const pong = makeBinaryJsonPong();
+        socket.send(pong, { binary: true });
         lastPongTs = Date.now();
         pushLog({ type: "json_pong_sent", reason: "server_empty_json" });
       } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
       return;
     }
 
-    // Connect ack
     if (parsed && parsed.id === 1 && parsed.connect) {
       pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect });
       return;
     }
 
-    // Основная логика: push-сообщения (игроки, ставки)
-    if (parsed && parsed.push) {
-      try {
-        const betsBase64 = parsed.push.data;
-        if (betsBase64) {
-          const decodedStr = Buffer.from(betsBase64, "base64").toString("utf8");
-          const decodedJson = JSON.parse(decodedStr);
-
-          const counts = {};
-          function traverse(obj) {
-            if (obj && typeof obj === "object") {
-              if (obj.bet && obj.bet.data && obj.bet.data.type === "topBetCreated") {
-                const gameId = obj.bet.data.bet.gameId;
-                const status = obj.bet.data.bet.status;
-                if (status === 1) counts[gameId] = (counts[gameId] || 0) + 1;
-              }
-              for (const k in obj) traverse(obj[k]);
-            }
-          }
-          traverse(decodedJson);
-
-          for (const [gameId, participants] of Object.entries(counts)) {
-            pushLog({ type: "game_participants", GameID: gameId, participants });
-          }
-        }
-      } catch (e) {
-        pushLog({ type: "base64_parse_error", error: String(e) });
-      }
-      return;
-    }
-
-    if (parsed && parsed.id !== undefined) {
-      pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" });
-      return;
-    }
-
-    if (parsed) {
-      pushLog({ type: "message_parsed", summary: typeof parsed === "object" ? Object.keys(parsed).slice(0,5) : String(parsed).slice(0,200) });
-      return;
-    }
-
+    if (parsed && parsed.push) return;
+    if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
+    if (parsed) { pushLog({ type: "message_parsed", summary: typeof parsed === "object" ? Object.keys(parsed).slice(0,5) : String(parsed).slice(0,200) }); return; }
     pushLog({ type: "message_nonjson", size: Buffer.isBuffer(data) ? data.length : String(data).length });
   });
 
-  socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch(e){ pushLog({ type: "transport_ping_err", error: String(e) }); } });
+  socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); } });
   socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
   socket.on("close", (code, reasonBuf) => {
     const reason = (reasonBuf && reasonBuf.length) ? reasonBuf.toString() : "";
@@ -169,10 +151,8 @@ async function mainLoop() {
     try {
       const token = await fetchToken();
       if (!token) { await new Promise(r => setTimeout(r, 3000)); continue; }
-
       pushLog({ type: "start_connect", url: WS_URL, channel: CHANNEL });
       console.log("[RUN] connecting to", WS_URL);
-
       ws = new WebSocket(WS_URL, { handshakeTimeout: OPEN_TIMEOUT_MS });
       attachWsHandlers(ws);
 
@@ -245,10 +225,20 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Новый эндпоинт для GameID
+  if (req.url === "/games") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ts: nowIso(), games: gamesStats }));
+    return;
+  }
+
   res.writeHead(404); res.end("not found");
 });
 
-server.listen(PORT, () => { pushLog({ type: "http_listen", port: PORT }); console.log("[HTTP] listening", PORT); });
+server.listen(PORT, () => {
+  pushLog({ type: "http_listen", port: PORT });
+  console.log("[HTTP] listening", PORT);
+});
 
 // ----------------- Периодические задачи -----------------
 setInterval(() => {
@@ -277,10 +267,8 @@ function keepAlive() {
   if (!SELF_URL) return;
   const delay = 240000 + Math.random() * 120000;
   setTimeout(async () => {
-    try {
-      await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } });
-      console.log("Keep-alive ping OK");
-    } catch (e) { console.log("Keep-alive error:", e.message); }
+    try { await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } }); console.log("Keep-alive ping OK"); }
+    catch (e) { console.log("Keep-alive error:", e.message); }
     keepAlive();
   }, delay);
 }
