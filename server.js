@@ -1,89 +1,115 @@
-const express = require('express');
-const axios = require('axios');
+
+// index.js
+import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// Твой краткоживущий JWT
-const JWT = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc';
-
-// Начальная игра
-let currentGameId = 6233329;
-
-// Храним все игры здесь
+// Массив для хранения игр
 let gamesBuffer = [];
 
-// Функция для запроса одной игры по gameId
-async function fetchGame(gameId) {
+// Конфигурация
+const API_URL = "https://api.example-game.com/game"; // <-- сюда реальный URL API игры
+const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5..."; // <-- твой токен
+
+// Функция для получения игр пачкой
+async function fetchGamesBatch(startGameId, batchSize) {
+  const batchGames = [];
+  for (let i = 0; i < batchSize; i++) {
+    const gameId = startGameId - i;
     try {
-        const res = await axios.get(`https://example.com/api/game/${gameId}`, {
-            headers: { Authorization: `Bearer ${JWT}` }
-        });
+      const response = await fetch(`${API_URL}/${gameId}`, {
+        headers: {
+          Authorization: `Bearer ${JWT_TOKEN}`,
+        },
+      });
+      const data = await response.json();
 
-        const data = res.data.data;
-
-        // Преобразуем ставки
-        const bets = data.bets.map(bet => ({
-            userId: bet.user.id,
-            username: bet.user.name,
-            userBlm: bet.user.blm,
-            depositAmount: bet.deposit.amount,
-            withdrawAmount: bet.withdraw.amount,
-            coefficient: bet.coefficient,
-            coefficientAuto: bet.coefficientAuto,
-            time: bet.createdAt,
-            skinsUsed: bet.deposit.items.length
-        }));
-
-        return {
-            gameId: data.id,
-            crash: data.crash,
-            salt: data.salt,
-            hashRound: data.hashRound,
-            bets
-        };
-
+      // Чистый JSON по твоему формату
+      const game = {
+        id: data.data.id,
+        crash: data.data.crash,
+        salt: data.data.salt,
+        hashRound: data.data.hashRound,
+        bets: data.data.bets.map(bet => ({
+          userId: bet.user.id,
+          userName: bet.user.name,
+          userBlm: bet.user.blm,
+          depositAmount: bet.deposit.amount,
+          withdrawAmount: bet.withdraw.amount,
+          coefficient: bet.coefficient,
+          coefficientAuto: bet.coefficientAuto,
+          itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
+        })),
+      };
+      batchGames.push(game);
     } catch (err) {
-        console.error(`Ошибка запроса gameId ${gameId}:`, err.message);
-        return null;
-    }
-}
-
-// Функция для пачки игр
-async function fetchGamesBatch(batchSize = 40) {
-    const promises = [];
-    for (let i = 0; i < batchSize; i++) {
-        promises.push(fetchGame(currentGameId));
-        currentGameId--; // идем вниз
+      console.log(`Ошибка при запросе игры ${gameId}:`, err.message);
     }
 
-    const results = await Promise.all(promises);
-    const validGames = results.filter(g => g !== null);
-    gamesBuffer.push(...validGames);
-    console.log(`Собрано игр: ${gamesBuffer.length}`);
+    // Пауза 1.5 сек между запросами
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return batchGames;
 }
 
-// Endpoint для отдачи всех игр
-app.get('/games', (req, res) => {
-    res.json({
-        success: true,
-        date: new Date().toISOString(),
-        games: gamesBuffer
+// Публичный endpoint для всех игр
+app.get("/games", (req, res) => {
+  res.json(gamesBuffer);
+});
+
+// Старт сбора игр
+app.get("/start", async (req, res) => {
+  const startGameId = parseInt(req.query.startId) || 6233329;
+  const batchSize = parseInt(req.query.batchSize) || 40;
+  const totalGames = parseInt(req.query.totalGames) || 30000;
+
+  let currentId = startGameId;
+  while (gamesBuffer.length < totalGames) {
+    const batch = await fetchGamesBatch(currentId, batchSize);
+    gamesBuffer.push(...batch);
+    currentId -= batchSize;
+    console.log(`Собрано ${gamesBuffer.length} игр`);
+  }
+
+  res.json({ message: `Собрано ${gamesBuffer.length} игр` });
+});
+
+// Слушаем все интерфейсы
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
+});
+// ===============================
+//   REDIS ANTI-IDLE KEEPALIVE
+// ===============================
+(async () => {
+  try {
+    const redis = createRedisClient({
+      url: process.env.REDIS_URL,
+      socket: {
+        reconnectStrategy: (retries) => Math.min(500 * retries, 3000),
+        keepAlive: 10000,
+        connectTimeout: 10000
+      }
     });
-});
 
-// Запуск сервера
-app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    redis.on("error", (err) => console.warn("[Redis] ERROR:", err.message));
+    redis.on("connect", () => console.log("[Redis] connected (anti-idle)"));
+    redis.on("reconnecting", () => console.log("[Redis] reconnecting..."));
 
-    // Тест: собираем первую пачку раз в 2 секунды
-    const interval = setInterval(async () => {
-        await fetchGamesBatch(40);
+    await redis.connect();
 
-        // Остановим после 30 000 игр (или можно убрать лимит для бесконечной работы)
-        if (gamesBuffer.length >= 30000) {
-            console.log('Собрано 30 000 игр, останавливаем сбор.');
-            clearInterval(interval);
-        }
-    }, 2000);
-});
+    setInterval(async () => {
+      try {
+        await redis.ping();
+        console.log("[Redis] ping");
+      } catch (err) {
+        console.warn("[Redis] ping failed:", err.message);
+      }
+    }, 20000);
+
+  } catch (e) {
+    console.error("[Redis] init failed:", e.message);
+  }
+})();
