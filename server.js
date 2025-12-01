@@ -62,7 +62,7 @@ async function fetchGamesSequential(startGameId, totalGames) {
     }
 
     currentId--;
-    await new Promise(r => setTimeout(r, 1000)); // пауза 1 секунда
+    await new Promise(r => setTimeout(r, 4000)); // пауза 1 секунда
   }
 }
 
