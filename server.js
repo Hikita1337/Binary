@@ -1,82 +1,59 @@
 import express from "express";
 import fetch from "node-fetch";
-import { createClient as createRedisClient } from "redis";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 let gamesBuffer = [];
-
-// Конфигурация
-const API_URL = "https://cs2run.app/games";
-const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc";
+let JWT_TOKEN = ""; // краткоживущий токен
 const REQUEST_DELAY = 1000; // 1 секунда
-
-// Ротация User-Agent
-const userAgents = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/118.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 Version/16.5 Safari/605.1.15",
-  "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/117.0 Mobile Safari/537.36",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Version/17.2 Mobile Safari/604.1",
-  "Mozilla/5.0 (Linux; U; Android 12; en-us) AppleWebKit/533.1 Mobile Safari/533.1",
-  "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) Gecko/20100101 Firefox/118.0",
-  "Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/604.1.38 Version/16.4 Mobile Safari/604.1",
-  "Mozilla/5.0 (Windows NT 6.3; Win64; x64) Chrome/107.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_5) Firefox/117.0",
-  "Mozilla/5.0 (Linux; Android 10) Chrome/110.0 Mobile Safari/537.36",
-];
+const REFRESH_URL = "https://cs2run.app/auth/refresh-token";
 
 // Ротация доменов Referer
 const referers = [
-  "https://csgoyz.run/crash/",
-  "https://csgouv.run/crash/",
-  "https://csgowx.run/crash/",
-  "https://csgoab.run/crash/",
-  "https://csgobc.run/crash/",
-  "https://csgode.run/crash/",
-  "https://csgofg.run/crash/",
-  "https://csgoih.run/crash/",
-  "https://csgojk.run/crash/",
-  "https://csgomn.run/crash/",
-  "https://csgopq.run/crash/",
-  "https://csgost.run/crash/",
-  "https://csgoac.run/crash/",
-  "https://csgobd.run/crash/",
-  "https://csgoef.run/crash/",
-  "https://csgogj.run/crash/",
-  "https://csgoid.run/crash/",
-  "https://cs2run.bet/",
-  "https://csrun.bet/",
-];
-
-let uaIndex = 0;
+  "https://csgoyz.run/crash/"];
 let refIndex = 0;
-
-function getNextUserAgent() {
-  uaIndex = (uaIndex + 1) % userAgents.length;
-  return userAgents[uaIndex];
-}
-
 function getNextReferer() {
   refIndex = (refIndex + 1) % referers.length;
   return referers[refIndex];
 }
 
-// Функция получения игры с лимитом попыток
-async function fetchGame(gameId, attempt = 1) {
+// Функция обновления JWT через refreshToken
+async function refreshJwt(refreshToken) {
+  try {
+    const res = await fetch(REFRESH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken }),
+    });
+    const data = await res.json();
+    if (data && data.token) {
+      JWT_TOKEN = data.token;
+      console.log("JWT обновлён через refreshToken");
+      return true;
+    } else {
+      console.log("Ошибка обновления JWT:", data);
+      return false;
+    }
+  } catch (e) {
+    console.log("Ошибка refreshJwt:", e.message);
+    return false;
+  }
+}
+
+// Получение игры с попытками и обновлением JWT при ошибке
+async function fetchGame(gameId, attempt = 1, refreshToken) {
   if (attempt > 12) {
     console.log(`Игра ${gameId} не получена после 12 попыток`);
     return null;
   }
 
-  const userAgent = getNextUserAgent();
   const referer = getNextReferer();
 
   try {
-    const response = await fetch(`${API_URL}/${gameId}`, {
+    const response = await fetch(`https://cs2run.app/games/${gameId}`, {
       headers: {
         Authorization: `JWT ${JWT_TOKEN}`,
-        "User-Agent": userAgent,
         Accept: "application/json, text/plain, */*",
         Referer: referer,
       },
@@ -84,13 +61,17 @@ async function fetchGame(gameId, attempt = 1) {
 
     if (!response.ok) {
       console.log(`Ошибка HTTP ${response.status} на игре ${gameId} → retry (${attempt})`);
-      return fetchGame(gameId, attempt + 1);
+      // если 401 или 429 — обновляем JWT через refreshToken
+      if ((response.status === 401 || response.status === 429) && refreshToken) {
+        await refreshJwt(refreshToken);
+      }
+      return fetchGame(gameId, attempt + 1, refreshToken);
     }
 
     const data = await response.json();
     if (!data.data) {
       console.log(`Пустой объект на игре ${gameId} → retry`);
-      return fetchGame(gameId, attempt + 1);
+      return fetchGame(gameId, attempt + 1, refreshToken);
     }
 
     return {
@@ -109,19 +90,18 @@ async function fetchGame(gameId, attempt = 1) {
         itemsUsed: bet.deposit.items.length > 0 ? 1 : 0,
       })),
     };
-
   } catch (err) {
     console.log(`Ошибка ${err.message} на игре ${gameId} → retry`);
-    return fetchGame(gameId, attempt + 1);
+    return fetchGame(gameId, attempt + 1, refreshToken);
   }
 }
 
 // Основной цикл
-async function fetchGamesSequential(startId, total) {
+async function fetchGamesSequential(startId, total, refreshToken) {
   let current = startId;
 
   while (gamesBuffer.length < total) {
-    const game = await fetchGame(current);
+    const game = await fetchGame(current, 1, refreshToken);
     if (game) {
       gamesBuffer.push(game);
       console.log(`Собрано: ${gamesBuffer.length}, ID: ${game.id}`);
@@ -134,11 +114,20 @@ async function fetchGamesSequential(startId, total) {
 // API
 app.get("/games", (req, res) => res.json(gamesBuffer));
 
-app.get("/start", (req, res) => {
+app.get("/start", async (req, res) => {
   const start = parseInt(req.query.startGame);
   const count = parseInt(req.query.count);
-  fetchGamesSequential(start, count);
-  res.json({ message: `Запуск с ${start} на ${count} игр` });
+  const refreshToken = req.query.refreshToken;
+
+  if (!refreshToken) {
+    return res.status(400).json({ message: "Нужен refreshToken" });
+  }
+
+  const ok = await refreshJwt(refreshToken);
+  if (!ok) return res.status(500).json({ message: "Не удалось обновить JWT" });
+
+  fetchGamesSequential(start, count, refreshToken);
+  res.json({ message: `Запуск с ${start} на ${count} игр с использованием refreshToken` });
 });
 
 app.post("/a", (req, res) => {
