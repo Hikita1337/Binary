@@ -8,20 +8,69 @@ const PORT = process.env.PORT || 3000;
 let gamesBuffer = [];
 
 // Конфигурация
-const API_URL = "https://cs2run.app/games"; 
+const API_URL = "https://cs2run.app/games";
 const JWT_TOKEN = "YOUR_JWT_TOKEN";
+const REQUEST_DELAY = 1000; // 1 секунда
 
-// Список User-Agent для рандома
+// Ротация User-Agent
 const userAgents = [
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X)...",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_6)...",
-  // добавь ещё варианты
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/118.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 Version/16.5 Safari/605.1.15",
+  "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/117.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Version/17.2 Mobile Safari/604.1",
+  "Mozilla/5.0 (Linux; U; Android 12; en-us) AppleWebKit/533.1 Mobile Safari/533.1",
+  "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) Gecko/20100101 Firefox/118.0",
+  "Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/604.1.38 Version/16.4 Mobile Safari/604.1",
+  "Mozilla/5.0 (Windows NT 6.3; Win64; x64) Chrome/107.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_5) Firefox/117.0",
+  "Mozilla/5.0 (Linux; Android 10) Chrome/110.0 Mobile Safari/537.36",
 ];
 
-// Функция для получения игры
-async function fetchGame(gameId) {
-  const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+// Ротация доменов Referer
+const referers = [
+  "https://csgoyz.run/crash/",
+  "https://csgouv.run/crash/",
+  "https://csgowx.run/crash/",
+  "https://csgoab.run/crash/",
+  "https://csgobc.run/crash/",
+  "https://csgode.run/crash/",
+  "https://csgofg.run/crash/",
+  "https://csgoih.run/crash/",
+  "https://csgojk.run/crash/",
+  "https://csgomn.run/crash/",
+  "https://csgopq.run/crash/",
+  "https://csgost.run/crash/",
+  "https://csgoac.run/crash/",
+  "https://csgobd.run/crash/",
+  "https://csgoef.run/crash/",
+  "https://csgogj.run/crash/",
+  "https://csgoid.run/crash/",
+  "https://cs2run.bet/",
+  "https://csrun.bet/",
+];
+
+let uaIndex = 0;
+let refIndex = 0;
+
+function getNextUserAgent() {
+  uaIndex = (uaIndex + 1) % userAgents.length;
+  return userAgents[uaIndex];
+}
+
+function getNextReferer() {
+  refIndex = (refIndex + 1) % referers.length;
+  return referers[refIndex];
+}
+
+// Функция получения игры с лимитом попыток
+async function fetchGame(gameId, attempt = 1) {
+  if (attempt > 12) {
+    console.log(`Игра ${gameId} не получена после 12 попыток`);
+    return null;
+  }
+
+  const userAgent = getNextUserAgent();
+  const referer = getNextReferer();
 
   try {
     const response = await fetch(`${API_URL}/${gameId}`, {
@@ -29,20 +78,19 @@ async function fetchGame(gameId) {
         Authorization: `JWT ${JWT_TOKEN}`,
         "User-Agent": userAgent,
         Accept: "application/json, text/plain, */*",
-        Referer: "https://csgoyz.run/crash/",
+        Referer: referer,
       },
     });
 
     if (!response.ok) {
-      console.log(`Ошибка при запросе игры ${gameId}: HTTP ${response.status}`);
-      return fetchGame(gameId); // повторяем при ошибке
+      console.log(`Ошибка HTTP ${response.status} на игре ${gameId} → retry (${attempt})`);
+      return fetchGame(gameId, attempt + 1);
     }
 
     const data = await response.json();
-
     if (!data.data) {
-      console.log(`Игра ${gameId} вернула пустой объект`);
-      return fetchGame(gameId);
+      console.log(`Пустой объект на игре ${gameId} → retry`);
+      return fetchGame(gameId, attempt + 1);
     }
 
     return {
@@ -63,56 +111,39 @@ async function fetchGame(gameId) {
     };
 
   } catch (err) {
-    console.log(`Ошибка при запросе игры ${gameId}: ${err.message}`);
-    return fetchGame(gameId);
+    console.log(`Ошибка ${err.message} на игре ${gameId} → retry`);
+    return fetchGame(gameId, attempt + 1);
   }
 }
 
-// Последовательная сборка игр
-async function fetchGamesSequential(startGameId, totalGames) {
-  let currentId = startGameId;
+// Основной цикл
+async function fetchGamesSequential(startId, total) {
+  let current = startId;
 
-  while (gamesBuffer.length < totalGames) {
-    const game = await fetchGame(currentId);
-    gamesBuffer.push(game);
-    currentId--;
-
-    await new Promise(r => setTimeout(r, 1000)); // пауза 1 сек
-    console.log(`Собрано ${gamesBuffer.length} игр`);
+  while (gamesBuffer.length < total) {
+    const game = await fetchGame(current);
+    if (game) {
+      gamesBuffer.push(game);
+      console.log(`Собрано: ${gamesBuffer.length}, ID: ${game.id}`);
+    }
+    current--;
+    await new Promise(r => setTimeout(r, REQUEST_DELAY));
   }
 }
 
-// Endpoints
+// API
 app.get("/games", (req, res) => res.json(gamesBuffer));
 
 app.get("/start", (req, res) => {
-  const startGameId = parseInt(req.query.startId) || 6233360;
-  const totalGames = parseInt(req.query.totalGames) || 30000;
-  fetchGamesSequential(startGameId, totalGames);
-  res.json({ message: `Сбор игр запущен с ID ${startGameId} на ${totalGames} игр` });
+  const start = parseInt(req.query.startGame);
+  const count = parseInt(req.query.count);
+  fetchGamesSequential(start, count);
+  res.json({ message: `Запуск с ${start} на ${count} игр` });
 });
 
 app.post("/a", (req, res) => {
-  res.json({ message: "Сервер завершает работу..." });
-  console.log("Shutdown endpoint вызван, завершение процесса.");
-  process.exit(0);
+  res.json({ message: "Сервер завершает работу" });
+  setTimeout(() => process.exit(0), 300);
 });
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));
-
-// ===============================
-// REDIS ANTI-IDLE KEEPALIVE
-// ===============================
-(async () => {
-  try {
-    const redis = createRedisClient({
-      url: process.env.REDIS_URL,
-      socket: { reconnectStrategy: retries => Math.min(500 * retries, 3000), keepAlive: 10000, connectTimeout: 10000 }
-    });
-    redis.on("error", (err) => console.warn("[Redis] ERROR:", err.message));
-    redis.on("connect", () => console.log("[Redis] connected (anti-idle)"));
-    redis.on("reconnecting", () => console.log("[Redis] reconnecting..."));
-    await redis.connect();
-    setInterval(async () => { try { await redis.ping(); console.log("[Redis] ping"); } catch (err) { console.warn("[Redis] ping failed:", err.message); } }, 20000);
-  } catch (e) { console.error("[Redis] init failed:", e.message); }
-})();
+app.listen(PORT, "0.0.0.0", () => console.log(`RUN: ${PORT}`));
