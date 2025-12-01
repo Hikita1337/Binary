@@ -9,7 +9,7 @@ let gamesBuffer = [];
 
 // Конфигурация
 const API_URL = "https://cs2run.app/games";
-const JWT_TOKEN = "YOUR_JWT_TOKEN";
+const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc";
 const REQUEST_DELAY = 1000; // 1 секунда
 
 // Ротация User-Agent
