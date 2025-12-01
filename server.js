@@ -10,7 +10,7 @@ let gamesBuffer = [];
 const API_URL = "https://cs2run.app/games";
 
 // Фиксированный токен
-const accessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ2MTcxNjUsImV4cCI6MTc2NTQ4MTE2NX0.E3g2QZGg54ix3yb5ZtSnUXsI_Nr6SxR1q_7mQd0Sfl0";
+const accessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ2MTgxODQsImV4cCI6MTc2NTQ4MjE4NH0.Qlhq1x4HDHjhvos6LLlhX7vqX5Is6hs7jYkDFqRwUdg";
 
 const REQUEST_DELAY = 1000;
 const MAX_ATTEMPTS_PER_GAME = 8;
