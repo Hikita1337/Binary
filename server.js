@@ -45,7 +45,7 @@ async function fetchGame(gameId) {
 
       if (status === 429) {
         const text = await safeRead(res);
-        const wait = Math.min(backoffBase * Math.pow(2, attempt), 30000);
+        const wait = Math.min(backoffBase * Math.pow(2, attempt), 20);
         console.log(`[429] game ${gameId}, attempt ${attempt}, wait ${wait}ms, body:`, text);
         await sleep(wait);
         continue;
@@ -71,13 +71,7 @@ async function fetchGame(gameId) {
         crash: d.crash,
         salt: d.salt,
         hashRound: d.hashRound,
-        bets: Array.isArray(d.bets) ? d.bets.map(bet => ({
-          userId: bet.user?.id ?? null,
-          userName: bet.user?.name ?? null,
-          depositAmount: bet.deposit?.amount ?? null,
-          withdrawAmount: bet.withdraw?.amount ?? null
-        })) : []
-      };
+        };
 
     } catch (err) {
       console.log(`Error game ${gameId}, attempt ${attempt}:`, err.message);
