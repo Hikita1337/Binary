@@ -1,13 +1,12 @@
-// server.js — Node (ESM) + ws
-// npm i ws
+// server.js — финальная версия
+// Node (ESM) + ws
+// Установка: npm i ws
 
 import WebSocket from "ws";
 import http from "http";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import zlib from "zlib";
-import crypto from "crypto";
 
 // ----------------- Конфиг (env или дефолты) -----------------
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
@@ -35,7 +34,7 @@ let logsBytes = 0;
 
 function nowIso() { return new Date().toISOString(); }
 
-// ----------------- Логирование -----------------
+// ----------------- Логирование (пуш-уведомления ОТСЕКАЕМ полностью) -----------------
 function approxSizeOfObj(o) {
   try {
     return Buffer.byteLength(JSON.stringify(o), "utf8");
@@ -43,11 +42,6 @@ function approxSizeOfObj(o) {
     return 200;
   }
 }
-
-function sha256Hex(buffer) {
-  return crypto.createHash("sha256").update(buffer).digest("hex");
-}
-
 function pushLog(entry) {
   entry.ts = nowIso();
   const size = approxSizeOfObj(entry);
@@ -64,6 +58,7 @@ function pushLog(entry) {
   // Для консоли выводим только важные типы (не пуши)
   const noisyTypes = new Set(["push", "push_full", "raw_msg"]);
   if (!noisyTypes.has(entry.type)) {
+    // компактный human-readable вывод
     console.log(JSON.stringify(entry));
   }
 }
@@ -106,80 +101,55 @@ function attachWsHandlers(socket) {
       parsed = null;
     }
 
-    // JSON пустой — ping центрифуги
     if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
+      // JSON ping -> отвечаем {"type":3}
       try {
         const pong = makeBinaryJsonPong();
-        socket.send(pong, { binary: true }, (err) => {
-          if (err) pushLog({ type: "json_pong_send_error", error: String(err) });
-          else {
-            lastPongTs = Date.now();
-            pushLog({ type: "json_pong_sent", reason: "server_empty_json" });
-          }
-        });
+        socket.send(pong, { binary: true });
+        lastPongTs = Date.now();
+        pushLog({ type: "json_pong_sent", reason: "server_empty_json" });
       } catch (e) {
         pushLog({ type: "json_pong_exception", error: String(e) });
       }
       return;
     }
 
-    // connect ack
     if (parsed && parsed.id === 1 && parsed.connect) {
       pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect });
       return;
     }
 
-    // push — игнорируем
-    if (parsed && parsed.push) return;
+    if (parsed && parsed.push) return; // игнорируем пуши
 
-    // сообщения служебного характера
     if (parsed && parsed.id !== undefined) {
       pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" });
       return;
     }
 
-    // остальные JSON
     if (parsed) {
       pushLog({ type: "message_parsed", summary: typeof parsed === "object" ? Object.keys(parsed).slice(0,5) : String(parsed).slice(0,200) });
       return;
     }
 
-    // ----------- message_nonjson в памяти с анализом -----------
-    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
-
-    let isText = false;
-    let preview = "";
-    let inflatedPreview = "";
-
-    try {
-      const txt = buffer.toString("utf8");
-      const nonAsciiRatio = txt.replace(/[ -~]/g, "").length / txt.length;
-      isText = nonAsciiRatio < 0.3;
-      preview = isText ? txt.slice(0, 200) : "";
-    } catch {}
-
-    try {
-      const inflated = zlib.inflateSync(buffer);
-      inflatedPreview = inflated.toString("utf8").slice(0, 200);
-    } catch {}
-
-    const hash = sha256Hex(buffer);
-
+    // === НЕПАРСИРУЕМОЕ сообщение ===
+    const bufferData = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
     pushLog({
       type: "message_nonjson",
-      size: buffer.length,
-      isText,
-      preview,
-      inflatedPreview,
-      hash
+      size: bufferData.length,
+      ts: nowIso(),
+      base64: bufferData.toString("base64") // добавлено для анализа
     });
   });
 
+  // транспортные ping/pong
   socket.on("ping", (data) => {
     try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); }
   });
 
-  socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
+  socket.on("pong", (data) => {
+    lastPongTs = Date.now();
+    pushLog({ type: "transport_pong_recv" });
+  });
 
   socket.on("close", (code, reasonBuf) => {
     const reason = (reasonBuf && reasonBuf.length) ? reasonBuf.toString() : "";
@@ -190,7 +160,10 @@ function attachWsHandlers(socket) {
     sessionStartTs = null;
   });
 
-  socket.on("error", (err) => { pushLog({ type: "ws_error", error: String(err) }); console.error("[WS ERROR]", err?.message || err); });
+  socket.on("error", (err) => {
+    pushLog({ type: "ws_error", error: String(err) });
+    console.error("[WS ERROR]", err?.message || err);
+  });
 }
 
 // ----------------- Основной цикл -----------------
@@ -225,7 +198,7 @@ async function mainLoop() {
         ws.send(JSON.stringify(payload));
         pushLog({ type: "subscribe_sent", channel: CHANNEL, id: 100 });
         console.log("[WS->] subscribe", CHANNEL);
-      } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e); }
+      } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e) }); }
 
       await new Promise((resolve) => {
         const onEnd = () => resolve();
@@ -248,6 +221,7 @@ async function mainLoop() {
 // ----------------- HTTP -----------------
 const server = http.createServer((req, res) => {
   if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n"); return; }
+
   if (req.url === "/status") {
     const connected = !!(ws && ws.readyState === WebSocket.OPEN);
     const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
@@ -266,12 +240,14 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(payload));
     return;
   }
+
   if (req.url === "/logs") {
     const payload = { ts: nowIso(), count: logs.length, tail: logs.slice(-MAX_LOG_ENTRIES) };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(payload));
     return;
   }
+
   res.writeHead(404); res.end("not found");
 });
 
@@ -293,22 +269,22 @@ setInterval(() => {
 }, HEARTBEAT_MS);
 
 // ----------------- Завершение -----------------
-process.on("SIGINT", () => { pushLog({ type: "shutdown", signal: "SIGINT" }); running = false; try { if(ws) ws.close(); } catch {} process.exit(0); });
-process.on("SIGTERM", () => { pushLog({ type: "shutdown", signal: "SIGTERM" }); running = false; try { if(ws) ws.close(); } catch {} process.exit(0); });
+process.on("SIGINT", () => { pushLog({ type: "shutdown", signal: "SIGINT" }); running = false; try { if (ws) ws.close(); } catch {} process.exit(0); });
+process.on("SIGTERM", () => { pushLog({ type: "shutdown", signal: "SIGTERM" }); running = false; try { if (ws) ws.close(); } catch {} process.exit(0); });
 
 // ----------------- Старт -----------------
 mainLoop().catch(e => { pushLog({ type: "fatal", error: String(e) }); console.error("[FATAL]", e); process.exit(1); });
 
-// ----------------- KEEP-ALIVE -----------------
+// =============================
+//       KEEP-ALIVE FOR RENDER
+// =============================
 const SELF_URL = process.env.RENDER_EXTERNAL_URL;
 function keepAlive() {
   if (!SELF_URL) return;
-  const delay = 240000 + Math.random() * 120000; // 4–6 минут
+  const delay = 240000 + Math.random() * 120000;
   setTimeout(async () => {
-    try {
-      await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } });
-      console.log("Keep-alive ping OK");
-    } catch (e) { console.log("Keep-alive error:", e.message); }
+    try { await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } }); console.log("Keep-alive ping OK"); }
+    catch (e) { console.log("Keep-alive error:", e.message); }
     keepAlive();
   }, delay);
 }
