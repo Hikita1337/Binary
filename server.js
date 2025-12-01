@@ -1,5 +1,3 @@
-
-// index.js
 import express from "express";
 import fetch from "node-fetch";
 import { createClient as createRedisClient } from "redis";
@@ -11,10 +9,10 @@ const PORT = process.env.PORT || 3000;
 let gamesBuffer = [];
 
 // Конфигурация
-const API_URL = "https://cs2run.app/games"; // <-- сюда реальный URL API игры
+const API_URL = "https://cs2run.app/games"; // <-- URL API игры
 const JWT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTg2ODYxLCJpYXQiOjE3NjQ0NDcyODQsImV4cCI6MTc2NTMxMTI4NH0.ZK1J86BGJJcOCw93MUnXrAsS3n0sLybUhd1EXSFULEc"; // <-- твой токен
 
-// Функция для получения игр пачкой
+// Функция для получения пачки игр параллельно
 async function fetchGamesBatch(startGameId, batchSize) {
   const requests = [];
   for (let i = 0; i < batchSize; i++) {
@@ -54,10 +52,8 @@ async function fetchGamesBatch(startGameId, batchSize) {
   }
 
   const batchGames = await Promise.all(requests);
-  // Убираем null
   return batchGames.filter(Boolean);
 }
-
 
 // Публичный endpoint для всех игр
 app.get("/games", (req, res) => {
@@ -72,14 +68,14 @@ app.get("/start", async (req, res) => {
 
   let currentId = startGameId;
   while (gamesBuffer.length < totalGames) {
-  const batch = await fetchGamesBatch(currentId, batchSize);
-  gamesBuffer.push(...batch);
-  currentId -= batchSize;
-  console.log(`Собрано ${gamesBuffer.length} игр`);
-  
-  // пауза 2–3 секунды между пачками
-  await new Promise(r => setTimeout(r, 2000));
-}
+    const batch = await fetchGamesBatch(currentId, batchSize);
+    gamesBuffer.push(...batch);
+    currentId -= batchSize;
+    console.log(`Собрано ${gamesBuffer.length} игр`);
+
+    // Пауза между пачками, чтобы API не ругался
+    await new Promise(r => setTimeout(r, 2500));
+  }
 
   res.json({ message: `Собрано ${gamesBuffer.length} игр` });
 });
@@ -88,17 +84,16 @@ app.get("/start", async (req, res) => {
 app.post("/a", (req, res) => {
   res.json({ message: "Сервер завершает работу..." });
   console.log("Shutdown endpoint вызван, завершение процесса.");
-  // Завершаем процесс через 500 мс, чтобы успел ответ вернуться
   setTimeout(() => process.exit(0), 500);
 });
-
 
 // Слушаем все интерфейсы
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
+
 // ===============================
-//   REDIS ANTI-IDLE KEEPALIVE
+// REDIS ANTI-IDLE KEEPALIVE
 // ===============================
 (async () => {
   try {
