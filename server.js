@@ -1,19 +1,15 @@
-// server.js — финальная версия
-// Node (ESM) + ws
-// Установка: npm i ws
-
+// server.js — Node (ESM) + ws
 import WebSocket from "ws";
 import http from "http";
 import fs from "fs";
 import path from "path";
 import os from "os";
 
-// ----------------- Конфиг (env или дефолты) -----------------
+// ----------------- Конфиг -----------------
 const WS_URL = process.env.WS_URL || "wss://ws.cs2run.app/connection/websocket";
 const TOKEN_URL = process.env.TOKEN_URL || "https://cs2run.app/current-state";
 const CHANNEL = process.env.CHANNEL || "csgorun:crash";
 const PORT = Number(process.env.PORT || 10000);
-
 const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 40000);
 const MAX_LOG_BYTES = Number(process.env.MAX_LOG_BYTES || 100 * 1024 * 1024);
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 5 * 60 * 1000);
@@ -23,7 +19,6 @@ const OPEN_TIMEOUT_MS = Number(process.env.OPEN_TIMEOUT_MS || 15000);
 let ws = null;
 let running = true;
 let reconnectAttempts = 0;
-
 let sessionStartTs = null;
 let lastPongTs = null;
 let lastDisconnect = null;
@@ -31,8 +26,8 @@ let lastDisconnect = null;
 let logs = [];
 let logsBytes = 0;
 
-// ----------------- Статистика игр -----------------
-let gamesStats = {}; // { [GameID]: number_of_participants }
+// объект GameID -> количество участников
+let gamesStats = {};
 
 function nowIso() { return new Date().toISOString(); }
 
@@ -45,16 +40,18 @@ function pushLog(entry) {
   const size = approxSizeOfObj(entry);
   logs.push(entry);
   logsBytes += size;
+
   while (logs.length > MAX_LOG_ENTRIES || logsBytes > MAX_LOG_BYTES) {
     const removed = logs.shift();
     logsBytes -= approxSizeOfObj(removed);
     if (logsBytes < 0) logsBytes = 0;
   }
+
   const noisyTypes = new Set(["push", "push_full", "raw_msg"]);
   if (!noisyTypes.has(entry.type)) console.log(JSON.stringify(entry));
 }
 
-// ----------------- Вспомогательные -----------------
+// ----------------- Получение токена -----------------
 async function fetchToken() {
   try {
     const resp = await fetch(TOKEN_URL, { cache: "no-store" });
@@ -72,6 +69,16 @@ function makeBinaryJsonPong() {
   return Buffer.from(JSON.stringify({ type: 3 }));
 }
 
+// ----------------- Рекурсивный сбор ставок -----------------
+function collectBets(obj) {
+  if (!obj || typeof obj !== "object") return;
+  if (obj.bet?.status === 1 && obj.bet.id) {
+    const gameId = obj.bet.id;
+    gamesStats[gameId] = (gamesStats[gameId] || 0) + 1;
+  }
+  for (const key in obj) collectBets(obj[key]);
+}
+
 // ----------------- Обработчики WS -----------------
 function attachWsHandlers(socket) {
   socket.on("open", () => {
@@ -83,57 +90,31 @@ function attachWsHandlers(socket) {
   });
 
   socket.on("message", (data) => {
+    // пытаемся декодировать JSON
     let parsed = null;
     let txt;
     try { txt = Buffer.isBuffer(data) ? data.toString("utf8") : String(data); parsed = JSON.parse(txt); } catch {}
     
     if (!parsed && Buffer.isBuffer(data)) {
-      // Попытка декодировать Base64
-      try {
-        const decodedStr = Buffer.from(data.toString(), 'base64').toString('utf8');
-        const decoded = JSON.parse(decodedStr);
-        if (decoded && decoded.push && decoded.push.pub && decoded.push.pub.data) {
-          // Ищем ставки людей
-          const bets = decoded.push.pub.data;
-          for (const key in bets) {
-            const bet = bets[key];
-            const betItems = bet?.bet?.deposit?.items || [];
-            if (bet?.bet?.status === 1 && betItems.length > 0) {
-              const gameId = bet.bet.id;
-              gamesStats[gameId] = (gamesStats[gameId] || 0) + 1;
-            }
-          }
-        }
-      } catch (e) {
-        // Игнорируем ошибки парсинга Base64
-      }
-      return;
+      try { parsed = JSON.parse(Buffer.from(data.toString(), "base64").toString("utf8")); } catch {}
     }
 
-    // === Оригинальные WS логики ===
+    // Если удалось распарсить, ищем ставки
+    if (parsed) collectBets(parsed);
+
+    // обрабатываем системные сообщения
     if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) {
-      try {
-        const pong = makeBinaryJsonPong();
-        socket.send(pong, { binary: true });
-        lastPongTs = Date.now();
-        pushLog({ type: "json_pong_sent", reason: "server_empty_json" });
-      } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
+      try { socket.send(makeBinaryJsonPong(), { binary: true }); lastPongTs = Date.now(); pushLog({ type: "json_pong_sent", reason: "server_empty_json" }); } catch (e) { pushLog({ type: "json_pong_exception", error: String(e) }); }
       return;
     }
-
-    if (parsed && parsed.id === 1 && parsed.connect) {
-      pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect });
-      return;
-    }
-
+    if (parsed && parsed.id === 1 && parsed.connect) { pushLog({ type: "connect_ack", client: parsed.connect.client || null, meta: parsed.connect }); return; }
     if (parsed && parsed.push) return;
     if (parsed && parsed.id !== undefined) { pushLog({ type: "msg_with_id", id: parsed.id, body_summary: parsed.error ? parsed.error : "ok" }); return; }
-    if (parsed) { pushLog({ type: "message_parsed", summary: typeof parsed === "object" ? Object.keys(parsed).slice(0,5) : String(parsed).slice(0,200) }); return; }
-    pushLog({ type: "message_nonjson", size: Buffer.isBuffer(data) ? data.length : String(data).length });
   });
 
   socket.on("ping", (data) => { try { socket.pong(data); pushLog({ type: "transport_ping_recv" }); } catch (e) { pushLog({ type: "transport_ping_err", error: String(e) }); } });
   socket.on("pong", (data) => { lastPongTs = Date.now(); pushLog({ type: "transport_pong_recv" }); });
+
   socket.on("close", (code, reasonBuf) => {
     const reason = (reasonBuf && reasonBuf.length) ? reasonBuf.toString() : "";
     const durationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
@@ -142,6 +123,7 @@ function attachWsHandlers(socket) {
     console.log(`[WS] CLOSE code=${code} reason=${reason} duration=${Math.round(durationMs/1000)}s`);
     sessionStartTs = null;
   });
+
   socket.on("error", (err) => { pushLog({ type: "ws_error", error: String(err) }); console.error("[WS ERROR]", err?.message || err); });
 }
 
@@ -151,8 +133,10 @@ async function mainLoop() {
     try {
       const token = await fetchToken();
       if (!token) { await new Promise(r => setTimeout(r, 3000)); continue; }
+
       pushLog({ type: "start_connect", url: WS_URL, channel: CHANNEL });
       console.log("[RUN] connecting to", WS_URL);
+
       ws = new WebSocket(WS_URL, { handshakeTimeout: OPEN_TIMEOUT_MS });
       attachWsHandlers(ws);
 
@@ -162,114 +146,63 @@ async function mainLoop() {
         ws.once("error", (e) => { clearTimeout(to); reject(e); });
       });
 
-      try {
-        const connectPayload = { id: 1, connect: { token, subs: {} } };
-        ws.send(JSON.stringify(connectPayload));
-        pushLog({ type: "connect_sent" });
-        console.log("[WS->] CONNECT sent");
-      } catch (e) { pushLog({ type: "connect_send_error", error: String(e) }); }
-
+      try { ws.send(JSON.stringify({ id:1, connect:{token, subs:{} } })); pushLog({ type:"connect_sent" }); console.log("[WS->] CONNECT sent"); } catch (e) { pushLog({ type:"connect_send_error", error:String(e) }); }
       await new Promise(r => setTimeout(r, 200));
-      try {
-        const payload = { id: 100, subscribe: { channel: CHANNEL } };
-        ws.send(JSON.stringify(payload));
-        pushLog({ type: "subscribe_sent", channel: CHANNEL, id: 100 });
-        console.log("[WS->] subscribe", CHANNEL);
-      } catch (e) { pushLog({ type: "subscribe_send_error", error: String(e) }); }
+      try { ws.send(JSON.stringify({ id:100, subscribe:{channel:CHANNEL} })); pushLog({ type:"subscribe_sent", channel:CHANNEL, id:100 }); console.log("[WS->] subscribe", CHANNEL); } catch(e){pushLog({type:"subscribe_send_error",error:String(e)})}
 
-      await new Promise((resolve) => {
-        const onEnd = () => resolve();
-        ws.once("close", onEnd);
-        ws.once("error", onEnd);
-      });
+      await new Promise(resolve => { ws.once("close", resolve); ws.once("error", resolve); });
 
       reconnectAttempts++;
       const backoff = Math.min(30000, 2000 * Math.pow(1.5, reconnectAttempts));
-      pushLog({ type: "reconnect_scheduled", attempt: reconnectAttempts, backoff_ms: Math.round(backoff) });
-      await new Promise(r => setTimeout(r, backoff));
-    } catch (e) {
-      pushLog({ type: "main_loop_exception", error: String(e) });
+      pushLog({ type:"reconnect_scheduled", attempt:reconnectAttempts, backoff_ms:Math.round(backoff) });
+      await new Promise(r=>setTimeout(r, backoff));
+    } catch(e) {
+      pushLog({ type:"main_loop_exception", error:String(e) });
       console.error("[MAIN EXCEPTION]", e?.message || e);
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r=>setTimeout(r,2000));
     }
   }
 }
 
 // ----------------- HTTP -----------------
-const server = http.createServer((req, res) => {
-  if (req.url === "/") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok\n"); return; }
-
-  if (req.url === "/status") {
+const server = http.createServer((req,res)=>{
+  if(req.url==="/"){ res.writeHead(200,{"Content-Type":"text/plain"}); res.end("ok\n"); return; }
+  if(req.url==="/status"){
     const connected = !!(ws && ws.readyState === WebSocket.OPEN);
-    const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
-    const payload = {
-      ts: nowIso(),
-      connected,
-      channel: CHANNEL,
-      session_start: sessionStartTs ? new Date(sessionStartTs).toISOString() : null,
-      session_duration_ms: sessionDurationMs,
-      session_duration_human: sessionDurationMs ? `${Math.round(sessionDurationMs/1000)}s` : null,
-      last_pong_ts: lastPongTs ? new Date(lastPongTs).toISOString() : null,
-      last_disconnect: lastDisconnect || null,
-      logs_count: logs.length
-    };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(payload));
-    return;
+    const sessionDurationMs = sessionStartTs ? (Date.now()-sessionStartTs) : 0;
+    const payload = { ts:nowIso(), connected, channel:CHANNEL, session_start: sessionStartTs?new Date(sessionStartTs).toISOString():null, session_duration_ms: sessionDurationMs, session_duration_human: sessionDurationMs?`${Math.round(sessionDurationMs/1000)}s`:null, last_pong_ts:lastPongTs?new Date(lastPongTs).toISOString():null, last_disconnect:lastDisconnect||null, logs_count:logs.length };
+    res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(payload)); return;
   }
-
-  if (req.url === "/logs") {
-    const payload = { ts: nowIso(), count: logs.length, tail: logs.slice(-MAX_LOG_ENTRIES) };
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(payload));
-    return;
+  if(req.url==="/logs"){
+    // вернем объект GameID -> количество участников
+    const payload = { ts:nowIso(), games: {...gamesStats} };
+    res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(payload)); return;
   }
-
-  // Новый эндпоинт для GameID
-  if (req.url === "/games") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ts: nowIso(), games: gamesStats }));
-    return;
-  }
-
   res.writeHead(404); res.end("not found");
 });
 
-server.listen(PORT, () => {
-  pushLog({ type: "http_listen", port: PORT });
-  console.log("[HTTP] listening", PORT);
-});
+server.listen(PORT,()=>{pushLog({type:"http_listen", port:PORT}); console.log("[HTTP] listening", PORT);});
 
-// ----------------- Периодические задачи -----------------
-setInterval(() => {
-  const connected = !!(ws && ws.readyState === WebSocket.OPEN);
-  const sessionDurationMs = sessionStartTs ? (Date.now() - sessionStartTs) : 0;
-  pushLog({ type: "heartbeat", connected, session_duration_ms: sessionDurationMs, logs_count: logs.length, logs_bytes: logsBytes });
+// ----------------- Heartbeat и метадамп -----------------
+setInterval(()=>{
+  const connected = !!(ws && ws.readyState===WebSocket.OPEN);
+  const sessionDurationMs = sessionStartTs ? (Date.now()-sessionStartTs) : 0;
+  pushLog({type:"heartbeat", connected, session_duration_ms:sessionDurationMs, logs_count:logs.length, logs_bytes:logsBytes});
   try {
     const fn = path.join(os.tmpdir(), `ws_sniffer_meta_${Date.now()}.json`);
-    fs.writeFileSync(fn, JSON.stringify({ ts: nowIso(), connected, entries: logs.length }, null, 2));
-    pushLog({ type: "meta_dump_saved", file: fn, entries: logs.length });
-  } catch (e) { pushLog({ type: "meta_dump_err", error: String(e) }); }
+    fs.writeFileSync(fn, JSON.stringify({ ts:nowIso(), connected, entries:logs.length }, null,2));
+    pushLog({ type:"meta_dump_saved", file:fn, entries:logs.length });
+  } catch(e){ pushLog({ type:"meta_dump_err", error:String(e) }); }
 }, HEARTBEAT_MS);
 
 // ----------------- Завершение -----------------
-process.on("SIGINT", () => { pushLog({ type: "shutdown", signal: "SIGINT" }); running = false; try { if (ws) ws.close(); } catch {} process.exit(0); });
-process.on("SIGTERM", () => { pushLog({ type: "shutdown", signal: "SIGTERM" }); running = false; try { if (ws) ws.close(); } catch {} process.exit(0); });
+process.on("SIGINT",()=>{ pushLog({type:"shutdown", signal:"SIGINT"}); running=false; try{if(ws)ws.close();}catch{} process.exit(0); });
+process.on("SIGTERM",()=>{ pushLog({type:"shutdown", signal:"SIGTERM"}); running=false; try{if(ws)ws.close();}catch{} process.exit(0); });
 
 // ----------------- Старт -----------------
-mainLoop().catch(e => { pushLog({ type: "fatal", error: String(e) }); console.error("[FATAL]", e); process.exit(1); });
+mainLoop().catch(e=>{ pushLog({type:"fatal", error:String(e)}); console.error("[FATAL]", e); process.exit(1); });
 
-// =============================
-//       KEEP-ALIVE FOR RENDER
-// =============================
+// ----------------- KEEP-ALIVE -----------------
 const SELF_URL = process.env.RENDER_EXTERNAL_URL;
-function keepAlive() {
-  if (!SELF_URL) return;
-  const delay = 240000 + Math.random() * 120000;
-  setTimeout(async () => {
-    try { await fetch(SELF_URL + "/healthz", { headers: { "User-Agent": "Mozilla/5.0", "X-Keep-Alive": String(Math.random()) } }); console.log("Keep-alive ping OK"); }
-    catch (e) { console.log("Keep-alive error:", e.message); }
-    keepAlive();
-  }, delay);
-}
+function keepAlive(){ if(!SELF_URL) return; const delay=240000+Math.random()*120000; setTimeout(async()=>{try{await fetch(SELF_URL+"/healthz",{headers:{"User-Agent":"Mozilla/5.0","X-Keep-Alive":String(Math.random())}}); console.log("Keep-alive ping OK");}catch(e){console.log("Keep-alive error:",e.message);} keepAlive(); }, delay);}
 keepAlive();
