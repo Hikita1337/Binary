@@ -77,6 +77,15 @@ app.get("/start", async (req, res) => {
   res.json({ message: `Собрано ${gamesBuffer.length} игр` });
 });
 
+// Endpoint для завершения контейнера
+app.post("/a", (req, res) => {
+  res.json({ message: "Сервер завершает работу..." });
+  console.log("Shutdown endpoint вызван, завершение процесса.");
+  // Завершаем процесс через 500 мс, чтобы успел ответ вернуться
+  setTimeout(() => process.exit(0), 500);
+});
+
+
 // Слушаем все интерфейсы
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
