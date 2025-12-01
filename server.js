@@ -5,60 +5,67 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 let gamesBuffer = [];
-let JWT_TOKEN = null; // будет обновляться через refresh
-const REQUEST_DELAY = 1000; // 1 секунда
+
+// Конфигурация
 const API_URL = "https://cs2run.app/games";
 const REFRESH_URL = "https://cs2run.app/auth/refresh-token";
+const REQUEST_DELAY = 1000; // 1 секунда
 
-// ----------------- REFRESH -----------------
-async function refreshJwt(refreshToken) {
+let accessToken = "";  // краткоживущий токен
+let refreshToken = ""; // рефреш токен
+
+// Обновление токенов через рефреш
+async function refreshJwt() {
   try {
     const res = await fetch(REFRESH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refreshToken })
+      body: JSON.stringify({ refreshToken }),
     });
     const data = await res.json();
-    if (!data || !data.accessToken) throw new Error("Invalid refresh response");
-    JWT_TOKEN = data.accessToken;
-    console.log("JWT обновлён через refresh");
+    if (!data || !data.data || !data.data.token || !data.data.refreshToken) {
+      throw new Error("Invalid refresh response");
+    }
+    accessToken = data.data.token;
+    refreshToken = data.data.refreshToken;
+    console.log("JWT обновлён:", accessToken);
   } catch (err) {
     console.error("Ошибка обновления JWT:", err.message);
     throw err;
   }
 }
 
-// ----------------- FETCH GAME -----------------
-async function fetchGame(gameId, refreshToken, attempt = 1) {
+// Получение одной игры с попытками и автообновлением токена
+async function fetchGame(gameId, attempt = 1) {
   if (attempt > 12) {
     console.log(`Игра ${gameId} не получена после 12 попыток`);
     return null;
   }
 
   try {
-    const res = await fetch(`${API_URL}/${gameId}`, {
+    const response = await fetch(`${API_URL}/${gameId}`, {
       headers: {
-        Authorization: `JWT ${JWT_TOKEN}`,
-        Accept: "application/json",
-        Referer: "https://csgoyz.run/crash/"
-      }
+        Authorization: `JWT ${accessToken}`,
+        Accept: "application/json, text/plain, */*",
+        Referer: "https://csgoyz.run/crash/",
+      },
     });
 
-    if (!res.ok) {
-      if (res.status === 401 || res.status === 429) {
-        console.log(`Ошибка ${res.status} на игре ${gameId}, обновляем токен → retry (${attempt})`);
-        await refreshJwt(refreshToken);
-        return fetchGame(gameId, refreshToken, attempt + 1);
-      } else {
-        console.log(`Ошибка HTTP ${res.status} на игре ${gameId} → retry (${attempt})`);
-        return fetchGame(gameId, refreshToken, attempt + 1);
-      }
+    if (response.status === 429 || response.status === 401) {
+      console.log(`Ошибка HTTP ${response.status} на игре ${gameId} → обновляем токены и retry (${attempt})`);
+      await refreshJwt(); // обновляем токены
+      return fetchGame(gameId, attempt + 1); // повторяем тот же запрос
     }
 
-    const data = await res.json();
+    if (!response.ok) {
+      console.log(`Ошибка HTTP ${response.status} на игре ${gameId} → retry (${attempt})`);
+      return fetchGame(gameId, attempt + 1);
+    }
+
+    const data = await response.json();
     if (!data.data) {
-      console.log(`Пустой объект на игре ${gameId} → retry (${attempt})`);
-      return fetchGame(gameId, refreshToken, attempt + 1);
+      console.log(`Пустой объект на игре ${gameId} → retry`);
+      return fetchGame(gameId, attempt + 1);
     }
 
     return {
@@ -80,19 +87,17 @@ async function fetchGame(gameId, refreshToken, attempt = 1) {
 
   } catch (err) {
     console.log(`Ошибка ${err.message} на игре ${gameId} → retry (${attempt})`);
-    return fetchGame(gameId, refreshToken, attempt + 1);
+    await new Promise(r => setTimeout(r, 500));
+    return fetchGame(gameId, attempt + 1);
   }
 }
 
-// ----------------- MAIN LOOP -----------------
-async function fetchGamesSequential(startId, total, refreshToken) {
-  // Обновляем JWT сразу при первом запуске
-  await refreshJwt(refreshToken);
-
+// Основной цикл
+async function fetchGamesSequential(startId, total) {
   let current = startId;
 
   while (gamesBuffer.length < total) {
-    const game = await fetchGame(current, refreshToken);
+    const game = await fetchGame(current);
     if (game) {
       gamesBuffer.push(game);
       console.log(`Собрано: ${gamesBuffer.length}, ID: ${game.id}`);
@@ -102,20 +107,29 @@ async function fetchGamesSequential(startId, total, refreshToken) {
   }
 }
 
-// ----------------- API -----------------
+// API
 app.get("/games", (req, res) => res.json(gamesBuffer));
 
+// Старт с указанием игры, количества и refreshToken
 app.get("/start", async (req, res) => {
   const start = parseInt(req.query.startGame);
   const count = parseInt(req.query.count);
-  const refreshToken = req.query.refreshToken;
+  const clientRefreshToken = req.query.refreshToken;
 
-  if (!refreshToken) return res.status(400).json({ error: "Не указан refreshToken" });
+  if (!clientRefreshToken) return res.status(400).json({ error: "Не указан refreshToken" });
 
-  fetchGamesSequential(start, count, refreshToken);
-  res.json({ message: `Запуск с ${start} на ${count} игр` });
+  refreshToken = clientRefreshToken;
+
+  try {
+    await refreshJwt(); // сразу обновляем токены при старте
+    fetchGamesSequential(start, count); // запускаем основной сбор
+    res.json({ message: `Запуск с ${start} на ${count} игр` });
+  } catch (err) {
+    res.status(500).json({ error: "Не удалось обновить токены", detail: err.message });
+  }
 });
 
+// Завершение процесса
 app.post("/a", (req, res) => {
   res.json({ message: "Сервер завершает работу" });
   setTimeout(() => process.exit(0), 300);
